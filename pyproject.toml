@@ -1,0 +1,28 @@
+[project]
+name = "fixiq"
+version = "0.1.0"
+description = "FixIQ — Intelligent Incident Fix Advisor powered by OpenSRE"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.0",
+    "rich>=13.0",
+    "httpx>=0.24",
+    "opensre",
+]
+
+[project.scripts]
+fixiq = "app.cli.main:cli"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
