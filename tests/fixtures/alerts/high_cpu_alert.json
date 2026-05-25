@@ -1,0 +1,24 @@
+{
+  "title": "High CPU usage in payment-service",
+  "message": "payment-service CPU usage above 90% for 5 minutes",
+  "severity": "high",
+  "service": "payment-service",
+  "timestamp": "2026-05-25T16:00:00Z",
+  "labels": {
+    "service": "payment-service",
+    "namespace": "production"
+  },
+  "metrics": {
+    "cpu_usage_pct": 94,
+    "cpu_limit_pct": 100,
+    "memory_usage_mb": 420,
+    "request_rate_rps": 4100,
+    "error_rate_pct": 12,
+    "latency_p99_ms": 3200
+  },
+  "logs": [
+    "WARNING payment.py:67 CPU throttling detected",
+    "ERROR payment.py:89 Request timeout after 3000ms",
+    "WARNING payment.py:102 Queue depth increasing: 890 pending"
+  ]
+}

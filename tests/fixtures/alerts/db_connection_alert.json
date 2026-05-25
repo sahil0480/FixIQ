@@ -1,0 +1,23 @@
+{
+  "title": "Database connection pool exhausted",
+  "message": "checkout-api cannot acquire database connections",
+  "severity": "critical",
+  "service": "checkout-api",
+  "timestamp": "2026-05-25T16:00:00Z",
+  "labels": {
+    "service": "checkout-api",
+    "database": "postgres-primary"
+  },
+  "metrics": {
+    "active_connections": 200,
+    "max_connections": 200,
+    "waiting_requests": 450,
+    "error_rate_pct": 34,
+    "latency_ms": 8400
+  },
+  "logs": [
+    "ERROR checkout.py:184 DatabaseConnectionError: max connections exceeded",
+    "ERROR pool.py:92 ConnectionPool: all connections busy",
+    "WARNING checkout.py:201 Retrying connection attempt 3/3"
+  ]
+}

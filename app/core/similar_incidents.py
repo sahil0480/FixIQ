@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Storage location
 INCIDENTS_PATH = (
-    Path.home() / ".config" / "fixiq" / "incidents.json"
+    Path.home() / ".config" / "fixiq" / "knowledge_base.json"
 )
 
 

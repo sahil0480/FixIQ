@@ -71,6 +71,14 @@ class EvidenceChainAnalyzer:
         log_evidence = self._extract_log_evidence(rca_output)
         evidence_items.extend(log_evidence)
 
+        # Extract directly from raw alert logs
+        alert_log_evidence = self._extract_alert_logs(alert_data)
+        evidence_items.extend(alert_log_evidence)
+
+        # Extract metrics from alert data
+        metric_evidence = self._extract_metric_evidence(alert_data)
+        evidence_items.extend(metric_evidence)
+
         # Extract file + line numbers
         affected_files = self._extract_file_locations(
             rca_output, evidence_items
@@ -154,7 +162,9 @@ class EvidenceChainAnalyzer:
                 line=line_num,
             )
         except Exception as exc:
-            logger.warning("Failed to parse evidence entry: %s", exc)
+            logger.warning(
+                "Failed to parse evidence entry: %s", exc
+            )
             return None
 
     def _extract_log_evidence(
@@ -167,13 +177,16 @@ class EvidenceChainAnalyzer:
 
         # Look for error patterns in report
         error_patterns = [
-            r'(\w+Error|\w+Exception).*?(?:at|in)\s+(\S+\.py)[:\s]+(\d+)',
+            r'(\w+Error|\w+Exception).*?(?:at|in)\s+'
+            r'(\S+\.py)[:\s]+(\d+)',
             r'File "([^"]+\.py)", line (\d+)',
             r'(\w+\.py):(\d+):\s*(ERROR|WARNING|CRITICAL)',
         ]
 
         for pattern in error_patterns:
-            matches = re.finditer(pattern, report, re.IGNORECASE)
+            matches = re.finditer(
+                pattern, report, re.IGNORECASE
+            )
             for match in matches:
                 groups = match.groups()
                 item = EvidenceItem(
@@ -181,8 +194,10 @@ class EvidenceChainAnalyzer:
                     source="log",
                     severity="ERROR",
                     message=match.group(0)[:200],
-                    file=groups[-2] if len(groups) >= 2 else None,
-                    line=int(groups[-1]) if groups[-1].isdigit() else None,
+                    file=groups[-2] if len(groups) >= 2
+                    else None,
+                    line=int(groups[-1])
+                    if groups[-1].isdigit() else None,
                 )
                 items.append(item)
 
@@ -194,6 +209,93 @@ class EvidenceChainAnalyzer:
                 severity="CRITICAL",
                 message=root_cause,
             ))
+
+        return items
+
+    def _extract_alert_logs(
+        self, alert_data: dict[str, Any]
+    ) -> list[EvidenceItem]:
+        """Extract evidence directly from alert log lines."""
+        items = []
+        logs = alert_data.get("logs", [])
+
+        for log in logs:
+            # Detect severity from log prefix
+            severity = "INFO"
+            if log.startswith("CRITICAL"):
+                severity = "CRITICAL"
+            elif log.startswith("ERROR"):
+                severity = "ERROR"
+            elif log.startswith("WARNING"):
+                severity = "WARNING"
+
+            # Extract file and line number
+            file_match = re.search(
+                r'([a-zA-Z_/]+\.py):(\d+)', log
+            )
+            file_name = None
+            line_num = None
+            if file_match:
+                file_name = file_match.group(1)
+                line_num = int(file_match.group(2))
+
+            items.append(EvidenceItem(
+                timestamp=datetime.now().isoformat(),
+                source="log",
+                severity=severity,
+                message=log[:200],
+                file=file_name,
+                line=line_num,
+            ))
+
+        return items
+
+    def _extract_metric_evidence(
+        self, alert_data: dict[str, Any]
+    ) -> list[EvidenceItem]:
+        """Extract evidence from alert metrics."""
+        items = []
+        metrics = alert_data.get("metrics", {})
+
+        if not metrics:
+            return items
+
+        # Check for critical metric values
+        metric_checks = {
+            "memory_usage_mb": (
+                512, "Memory usage: {val}MB"
+            ),
+            "cpu_usage_pct": (
+                90, "CPU usage: {val}%"
+            ),
+            "error_rate_pct": (
+                10, "Error rate: {val}%"
+            ),
+            "active_connections": (
+                150, "Active connections: {val}"
+            ),
+            "restart_count": (
+                2, "Pod restart count: {val}"
+            ),
+            "latency_ms": (
+                3000, "Latency: {val}ms"
+            ),
+        }
+
+        for metric, (threshold, msg_template) in \
+                metric_checks.items():
+            value = metrics.get(metric)
+            if value is not None and value > threshold:
+                severity = (
+                    "CRITICAL" if value > threshold * 1.5
+                    else "ERROR"
+                )
+                items.append(EvidenceItem(
+                    timestamp=datetime.now().isoformat(),
+                    source="metric",
+                    severity=severity,
+                    message=msg_template.format(val=value),
+                ))
 
         return items
 
@@ -218,7 +320,9 @@ class EvidenceChainAnalyzer:
                     }
                 else:
                     files[key]["occurrences"] += 1
-                    files[key]["messages"].append(item.message)
+                    files[key]["messages"].append(
+                        item.message
+                    )
 
         # Sort by severity
         severity_order = {
@@ -229,7 +333,9 @@ class EvidenceChainAnalyzer:
         }
         return sorted(
             files.values(),
-            key=lambda x: severity_order.get(x["severity"], 4)
+            key=lambda x: severity_order.get(
+                x["severity"], 4
+            )
         )
 
     def _identify_root_trigger(
@@ -265,8 +371,9 @@ class EvidenceChainAnalyzer:
         file_count = len(affected_files)
 
         return (
-            f"Found {critical_count} critical and {error_count} "
-            f"error events across {file_count} files. "
+            f"Found {critical_count} critical and "
+            f"{error_count} error events across "
+            f"{file_count} files. "
             f"Root trigger: {root_trigger[:100]}"
         )
 
@@ -318,28 +425,37 @@ def display_evidence_chain(chain: EvidenceChain) -> None:
 
     print(f"\n  {BOLD}Root Trigger:{RESET}")
     print(f"  {chain.root_trigger}")
-    print(f"  {DIM}Confidence: {int(chain.confidence * 100)}%{RESET}")
+    print(
+        f"  {DIM}Confidence: "
+        f"{int(chain.confidence * 100)}%{RESET}"
+    )
 
     if chain.items:
         print(f"\n  {BOLD}Evidence Timeline:{RESET}")
         for i, item in enumerate(chain.items[:8], 1):
-            color = RED if item.severity == "CRITICAL" else \
-                    YELLOW if item.severity == "ERROR" else \
-                    GREEN
+            color = (
+                RED if item.severity == "CRITICAL" else
+                YELLOW if item.severity == "ERROR" else
+                GREEN
+            )
             print(
                 f"\n  {i}. [{color}{item.severity}{RESET}] "
+                f"{DIM}{item.source.upper()}{RESET} "
                 f"{DIM}{item.timestamp[11:19]}{RESET}"
             )
             print(f"     {item.message[:100]}")
             if item.file and item.line:
                 print(
-                    f"     {BOLD}→ {item.file}:{item.line}{RESET}"
+                    f"     {BOLD}→ {item.file}:"
+                    f"{item.line}{RESET}"
                 )
 
     if chain.affected_files:
         print(f"\n  {BOLD}Affected Files:{RESET}")
         for f in chain.affected_files[:5]:
-            line_str = f":{f['line']}" if f.get('line') else ""
+            line_str = (
+                f":{f['line']}" if f.get('line') else ""
+            )
             print(
                 f"  • {f['file']}{line_str}  "
                 f"({f['occurrences']} occurrence(s))"

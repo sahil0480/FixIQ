@@ -1,0 +1,35 @@
+{
+  "title": "Multiple service failures detected",
+  "message": "Cascading failures across checkout, payment and order services",
+  "severity": "critical",
+  "service": "api-gateway",
+  "timestamp": "2026-05-25T16:00:00Z",
+  "alerts": [
+    {
+      "service": "checkout-api",
+      "error": "DatabaseConnectionError at checkout.py:184",
+      "severity": "critical"
+    },
+    {
+      "service": "payment-service",
+      "error": "Timeout waiting for checkout-api response",
+      "severity": "high"
+    },
+    {
+      "service": "order-service",
+      "error": "checkout-api unavailable",
+      "severity": "high"
+    }
+  ],
+  "metrics": {
+    "error_rate_pct": 67,
+    "affected_users": 1200,
+    "latency_ms": 12000
+  },
+  "logs": [
+    "CRITICAL api-gateway.py:45 Multiple upstream failures",
+    "ERROR checkout.py:184 DatabaseConnectionError: pool exhausted",
+    "ERROR payment.py:67 Upstream checkout-api timeout",
+    "ERROR order.py:123 Service checkout-api unavailable"
+  ]
+}

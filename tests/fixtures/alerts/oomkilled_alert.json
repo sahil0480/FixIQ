@@ -1,0 +1,23 @@
+{
+  "title": "Pod OOMKilled in checkout-api",
+  "message": "Container checkout-api exceeded memory limit and was killed",
+  "severity": "critical",
+  "service": "checkout-api",
+  "namespace": "production",
+  "timestamp": "2026-05-25T16:00:00Z",
+  "labels": {
+    "pod": "checkout-api-7d9f8b-xkp2q",
+    "container": "checkout-api",
+    "namespace": "production"
+  },
+  "annotations": {
+    "description": "Pod checkout-api-7d9f8b-xkp2q exceeded memory limit of 512Mi",
+    "runbook": "https://runbooks.internal/oomkilled"
+  },
+  "metrics": {
+    "memory_usage_mb": 980,
+    "memory_limit_mb": 512,
+    "cpu_usage_pct": 45,
+    "restart_count": 3
+  }
+}
