@@ -6,6 +6,8 @@ Usage:
     fixiq analyze -i alert.json
     fixiq analyze -i alert.json --verify
     fixiq analyze -i alert.json --service checkout-api
+    fixiq multi -i alerts.json
+    fixiq multi -i alerts.json --analyze-top 3
 """
 
 from __future__ import annotations
@@ -37,12 +39,15 @@ def cli() -> None:
       - Cascade failure analysis — what to fix first
       - Anomaly timeline — when things went wrong
       - Similar incidents — what worked before
+      - Multi-alert prioritization — what to fix first
 
     \b
     Examples:
       fixiq analyze -i alert.json
       fixiq analyze -i alert.json --verify
       fixiq analyze -i alert.json --service checkout-api
+      fixiq multi -i alerts.json
+      fixiq multi -i alerts.json --analyze-top 3
     """
     pass
 
@@ -124,7 +129,9 @@ def analyze_command(
         "service", "unknown"
     )
 
-    console.print(f"\n  [bold]Root Cause:[/bold] {root_cause}")
+    console.print(
+        f"\n  [bold]Root Cause:[/bold] {root_cause}"
+    )
 
     # Verify mode
     if verify:
@@ -194,6 +201,139 @@ def analyze_command(
     )
 
 
+@cli.command(name="multi")
+@click.option(
+    "--input", "-i",
+    "input_file",
+    required=True,
+    type=click.Path(exists=True),
+    help="Path to JSON file containing multiple alerts.",
+)
+@click.option(
+    "--analyze-top",
+    "-n",
+    default=1,
+    show_default=True,
+    help="Number of top priority alerts to fully analyze.",
+)
+def multi_command(
+    input_file: str,
+    analyze_top: int,
+) -> None:
+    """Prioritize multiple alerts and analyze top ones.
+
+    \b
+    Examples:
+      fixiq multi -i alerts.json
+      fixiq multi -i alerts.json --analyze-top 3
+    """
+    from app.core.multi_alert import (
+        MultiAlertPrioritizer,
+        display_multi_alert_result,
+    )
+    from app.core.evidence_chain import (
+        EvidenceChainAnalyzer, display_evidence_chain
+    )
+    from app.core.cascade_analyzer import (
+        CascadeAnalyzer, display_cascade_analysis
+    )
+    from app.core.urgency import UrgencyScorer
+    from app.core.blast_radius import BlastRadiusAnalyzer
+
+    # Print header
+    _print_header()
+
+    # Load alerts file
+    alerts_path = Path(input_file)
+    try:
+        data = json.loads(alerts_path.read_text())
+        alerts = data.get("alerts", [])
+        console.print(
+            f"\n  Loading {len(alerts)} alerts "
+            f"from [bold]{input_file}[/bold]..."
+        )
+    except Exception as exc:
+        console.print(
+            f"\n  [bold red]Error loading alerts:"
+            f"[/bold red] {exc}"
+        )
+        return
+
+    if not alerts:
+        console.print(
+            "\n  [yellow]No alerts found.[/yellow]"
+        )
+        return
+
+    # Prioritize alerts
+    console.print("\n  Prioritizing alerts...")
+    prioritizer = MultiAlertPrioritizer()
+    result = prioritizer.prioritize(alerts)
+
+    # Display priority queue
+    display_multi_alert_result(result)
+
+    # Analyze top N alerts in detail
+    top_alerts = result.prioritized[:analyze_top]
+
+    for i, prioritized_alert in enumerate(top_alerts, 1):
+        alert_data = prioritized_alert.alert_data
+        service = prioritized_alert.service
+
+        console.print(
+            f"\n\n  [bold]━━━ Detailed Analysis: "
+            f"#{prioritized_alert.priority_rank} "
+            f"{service} ━━━[/bold]"
+        )
+
+        # Run investigation
+        console.print(
+            "\n  Running OpenSRE investigation..."
+        )
+        final_state = _run_investigation(alert_data)
+
+        root_cause = final_state.get(
+            "root_cause",
+            alert_data.get("title", "Unknown")
+        )
+        console.print(
+            f"  [bold]Root Cause:[/bold] {root_cause}"
+        )
+
+        # Evidence Chain
+        console.print(
+            "\n  Running deep investigation analysis..."
+        )
+        evidence = EvidenceChainAnalyzer().analyze(
+            final_state, alert_data
+        )
+        display_evidence_chain(evidence)
+
+        # Cascade Analysis
+        cascade = CascadeAnalyzer().analyze(
+            service, final_state
+        )
+        display_cascade_analysis(cascade)
+
+        # Urgency + Blast
+        urgency = UrgencyScorer().score(
+            service, final_state
+        )
+        blast = BlastRadiusAnalyzer().analyze(
+            service, final_state
+        )
+        _display_fixiq_summary(
+            console, root_cause,
+            {"affected_services": []},
+            urgency, blast
+        )
+
+        if i < len(top_alerts):
+            console.print(
+                f"\n  [dim]Moving to next alert...[/dim]"
+            )
+
+
 def _print_header() -> None:
     """Print FixIQ header."""
     console.print()
@@ -225,7 +365,9 @@ def _run_investigation(
                 alert_data.get("message", "Unknown")
             ),
             "recommended_actions": [],
-            "service": alert_data.get("service", "unknown"),
+            "service": alert_data.get(
+                "service", "unknown"
+            ),
             "evidence_entries": [],
             "report": "",
         }
@@ -248,8 +390,12 @@ def _display_fixiq_summary(
 
     # Impact
     console.print("\n  [bold]📊 AFFECTED SERVICES[/bold]")
-    for svc in impact.get("affected_services", []):
-        console.print(f"  • {svc}")
+    services = impact.get("affected_services", [])
+    if services:
+        for svc in services:
+            console.print(f"  • {svc}")
+    else:
+        console.print("  [dim]See cascade analysis above[/dim]")
 
     # Urgency
     console.print("\n  [bold]⏰ URGENCY[/bold]")
@@ -270,7 +416,8 @@ def _display_fixiq_summary(
     # Blast Radius
     console.print("\n  [bold]⚠️  BLAST RADIUS[/bold]")
     console.print(
-        f"  Users impacted: ~{blast.get('users_impacted', 0)}"
+        f"  Users impacted: "
+        f"~{blast.get('users_impacted', 0)}"
     )
     peak = blast.get("peak_traffic", False)
     peak_str = (

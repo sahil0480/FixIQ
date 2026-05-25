@@ -1,0 +1,72 @@
+{
+  "alerts": [
+    {
+      "id": "alert-001",
+      "title": "Pod OOMKilled in checkout-api",
+      "message": "Container exceeded memory limit",
+      "severity": "critical",
+      "service": "checkout-api",
+      "timestamp": "2026-05-25T16:00:00Z",
+      "metrics": {
+        "memory_usage_mb": 980,
+        "memory_limit_mb": 512,
+        "restart_count": 3,
+        "error_rate_pct": 45
+      }
+    },
+    {
+      "id": "alert-002",
+      "title": "High latency in logging-service",
+      "message": "Logging service response time increased",
+      "severity": "low",
+      "service": "logging",
+      "timestamp": "2026-05-25T16:01:00Z",
+      "metrics": {
+        "latency_ms": 800,
+        "error_rate_pct": 2
+      }
+    },
+    {
+      "id": "alert-003",
+      "title": "Database connection pool exhausted",
+      "message": "checkout-api cannot acquire database connections",
+      "severity": "critical",
+      "service": "checkout-api",
+      "timestamp": "2026-05-25T16:02:00Z",
+      "metrics": {
+        "active_connections": 200,
+        "max_connections": 200,
+        "error_rate_pct": 34,
+        "latency_ms": 8400
+      },
+      "logs": [
+        "ERROR checkout.py:184 DatabaseConnectionError: pool exhausted",
+        "ERROR pool.py:92 ConnectionPool: all connections busy"
+      ]
+    },
+    {
+      "id": "alert-004",
+      "title": "Auth service degraded",
+      "message": "Authentication service response time high",
+      "severity": "high",
+      "service": "auth-service",
+      "timestamp": "2026-05-25T16:03:00Z",
+      "metrics": {
+        "latency_ms": 2400,
+        "error_rate_pct": 8,
+        "cpu_usage_pct": 78
+      }
+    },
+    {
+      "id": "alert-005",
+      "title": "Monitoring dashboard unavailable",
+      "message": "Internal monitoring service is down",
+      "severity": "low",
+      "service": "monitoring",
+      "timestamp": "2026-05-25T16:04:00Z",
+      "metrics": {
+        "error_rate_pct": 100
+      }
+    }
+  ]
+}
