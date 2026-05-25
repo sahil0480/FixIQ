@@ -1,0 +1,26 @@
+{
+  "title": "Pod OOMKilled in checkout-api",
+  "message": "Container checkout-api exceeded memory limit and was killed",
+  "severity": "critical",
+  "service": "checkout-api",
+  "namespace": "default",
+  "timestamp": "2026-05-25T20:40:55Z",
+  "labels": {
+    "pod": "checkout-api-789d77895-kjghv",
+    "container": "checkout-api",
+    "namespace": "default"
+  },
+  "metrics": {
+    "memory_limit_mb": 5,
+    "memory_request_mb": 4,
+    "restart_count": 4,
+    "exit_code": 137,
+    "error_rate_pct": 100
+  },
+  "logs": [
+    "ERROR checkout-api container OOMKilled - exceeded memory limit of 5Mi",
+    "WARNING pod checkout-api-789d77895-kjghv restarted 4 times in last 2 minutes",
+    "CRITICAL memory.py:45 MemoryError: container killed by OOM killer",
+    "ERROR k8s_controller.py:89 Pod checkout-api-789d77895-kjghv entered CrashLoopBackOff"
+  ]
+}

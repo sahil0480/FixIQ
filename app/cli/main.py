@@ -8,6 +8,8 @@ Usage:
     fixiq analyze -i alert.json --service checkout-api
     fixiq multi -i alerts.json
     fixiq multi -i alerts.json --analyze-top 3
+    fixiq watch
+    fixiq watch --namespace production
 """
 
 from __future__ import annotations
@@ -48,6 +50,8 @@ def cli() -> None:
       fixiq analyze -i alert.json --service checkout-api
       fixiq multi -i alerts.json
       fixiq multi -i alerts.json --analyze-top 3
+      fixiq watch
+      fixiq watch --namespace production
     """
     pass
 
@@ -104,10 +108,8 @@ def analyze_command(
     from app.core.blast_radius import BlastRadiusAnalyzer
     from app.core.knowledge_base import KnowledgeBase
 
-    # Print header
     _print_header()
 
-    # Load alert
     alert_path = Path(input_file)
     try:
         alert_data = json.loads(alert_path.read_text())
@@ -120,7 +122,6 @@ def analyze_command(
         )
         return
 
-    # Run OpenSRE investigation
     console.print("\n  Running OpenSRE investigation...")
     final_state = _run_investigation(alert_data)
 
@@ -133,52 +134,44 @@ def analyze_command(
         f"\n  [bold]Root Cause:[/bold] {root_cause}"
     )
 
-    # Verify mode
     if verify:
         _run_verification(root_cause, console)
         return
 
-    # Run all 5 investigation modules
     console.print(
         "\n  Running deep investigation analysis..."
     )
 
-    # 1. Evidence Chain
     console.print("  → Building evidence chain...")
     evidence = EvidenceChainAnalyzer().analyze(
         final_state, alert_data
     )
     display_evidence_chain(evidence)
 
-    # 2. Deployment Correlation
     console.print("  → Checking deployment correlation...")
     correlation = DeploymentCorrelator().analyze(
         service_name, final_state, alert_data
     )
     display_deployment_correlation(correlation)
 
-    # 3. Cascade Analysis
     console.print("  → Analyzing cascade failures...")
     cascade = CascadeAnalyzer().analyze(
         service_name, final_state
     )
     display_cascade_analysis(cascade)
 
-    # 4. Anomaly Timeline
     console.print("  → Building anomaly timeline...")
     timeline = AnomalyTimelineAnalyzer().analyze(
         final_state, alert_data
     )
     display_anomaly_timeline(timeline)
 
-    # 5. Similar Incidents
     console.print("  → Searching similar incidents...")
     similar = SimilarIncidentsFinder().find(
         root_cause, service_name, final_state
     )
     display_similar_incidents(similar)
 
-    # FixIQ Layer — Impact, Urgency, Blast Radius
     impact = ImpactAnalyzer().analyze(
         service_name, final_state
     )
@@ -189,12 +182,10 @@ def analyze_command(
         service_name, final_state
     )
 
-    # Display FixIQ summary
     _display_fixiq_summary(
         console, root_cause, impact, urgency, blast
     )
 
-    # Save to knowledge base
     KnowledgeBase().save(root_cause, final_state)
     console.print(
         "\n  [dim]Incident saved to knowledge base.[/dim]"
@@ -240,10 +231,8 @@ def multi_command(
     from app.core.urgency import UrgencyScorer
     from app.core.blast_radius import BlastRadiusAnalyzer
 
-    # Print header
     _print_header()
 
-    # Load alerts file
     alerts_path = Path(input_file)
     try:
         data = json.loads(alerts_path.read_text())
@@ -265,15 +254,11 @@ def multi_command(
         )
         return
 
-    # Prioritize alerts
     console.print("\n  Prioritizing alerts...")
     prioritizer = MultiAlertPrioritizer()
     result = prioritizer.prioritize(alerts)
-
-    # Display priority queue
     display_multi_alert_result(result)
 
-    # Analyze top N alerts in detail
     top_alerts = result.prioritized[:analyze_top]
 
     for i, prioritized_alert in enumerate(top_alerts, 1):
@@ -286,7 +271,6 @@ def multi_command(
             f"{service} ━━━[/bold]"
         )
 
-        # Run investigation
         console.print(
             "\n  Running OpenSRE investigation..."
         )
@@ -300,7 +284,6 @@ def multi_command(
             f"  [bold]Root Cause:[/bold] {root_cause}"
         )
 
-        # Evidence Chain
         console.print(
             "\n  Running deep investigation analysis..."
         )
@@ -309,13 +292,11 @@ def multi_command(
         )
         display_evidence_chain(evidence)
 
-        # Cascade Analysis
         cascade = CascadeAnalyzer().analyze(
             service, final_state
         )
         display_cascade_analysis(cascade)
 
-        # Urgency + Blast
         urgency = UrgencyScorer().score(
             service, final_state
         )
@@ -332,6 +313,47 @@ def multi_command(
             console.print(
                 f"\n  [dim]Moving to next alert...[/dim]"
             )
+
+
+@cli.command(name="watch")
+@click.option(
+    "--namespace", "-n",
+    default="default",
+    show_default=True,
+    help="Kubernetes namespace to watch.",
+)
+@click.option(
+    "--opensre-path",
+    default=None,
+    help="Path to OpenSRE installation.",
+)
+def watch_command(
+    namespace: str,
+    opensre_path: str | None,
+) -> None:
+    """Watch Kubernetes for incidents and auto-analyze.
+
+    \b
+    Automatically:
+      1. Detects K8s incidents (OOMKilled, CrashLoop etc.)
+      2. Runs OpenSRE LLM investigation
+      3. Runs FixIQ deep analysis
+      4. Shows unified report
+
+    \b
+    Examples:
+      fixiq watch
+      fixiq watch --namespace production
+      fixiq watch --opensre-path ~/opensre
+    """
+    from app.core.pipeline import FixIQPipeline
+
+    pipeline = FixIQPipeline(
+        namespace=namespace,
+        opensre_path=opensre_path or
+        "/home/sahilx480/opensre",
+    )
+    pipeline.run()
 
 
 def _print_header() -> None:
@@ -388,16 +410,16 @@ def _display_fixiq_summary(
     )
     console.print(Rule(style="dim"))
 
-    # Impact
     console.print("\n  [bold]📊 AFFECTED SERVICES[/bold]")
     services = impact.get("affected_services", [])
     if services:
         for svc in services:
             console.print(f"  • {svc}")
     else:
-        console.print("  [dim]See cascade analysis above[/dim]")
+        console.print(
+            "  [dim]See cascade analysis above[/dim]"
+        )
 
-    # Urgency
     console.print("\n  [bold]⏰ URGENCY[/bold]")
     score = urgency.get("score", "UNKNOWN")
     level = urgency.get("level", 0)
@@ -413,7 +435,6 @@ def _display_fixiq_summary(
         f"  Fix within: {urgency.get('fix_within', 'N/A')}"
     )
 
-    # Blast Radius
     console.print("\n  [bold]⚠️  BLAST RADIUS[/bold]")
     console.print(
         f"  Users impacted: "
