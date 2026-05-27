@@ -5,6 +5,11 @@ automatically detects incidents.
 
 When an incident is detected it automatically
 triggers the full FixIQ pipeline.
+
+Smart deduplication:
+- Ignores events older than 5 minutes on startup
+- Tracks seen event IDs to avoid reprocessing
+- Tracks resolved services to avoid re-investigating
 """
 
 from __future__ import annotations
@@ -14,7 +19,7 @@ import logging
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -34,6 +39,12 @@ INCIDENT_EVENTS = {
     "ImagePullBackOff": "high",
     "ErrImagePull": "high",
 }
+
+# How long to ignore a resolved service (seconds)
+RESOLVED_COOLDOWN = 600  # 10 minutes
+
+# Max age of events to process on startup (seconds)
+STARTUP_EVENT_MAX_AGE = 300  # 5 minutes
 
 
 @dataclass
@@ -61,6 +72,9 @@ class K8sWatcher:
         self.namespace = namespace
         self.poll_interval = poll_interval
         self._seen_events: set[str] = set()
+        self._resolved_services: dict[str, float] = {}
+        self._startup_time = time.time()
+        self._is_startup = True
         self._running = False
 
     def watch(
@@ -79,6 +93,11 @@ class K8sWatcher:
         print(f"  Poll interval: {self.poll_interval}s")
         print(f"  Press Ctrl+C to stop\n")
 
+        # First poll marks startup events as seen
+        # without triggering investigations
+        self._seed_seen_events()
+        self._is_startup = False
+
         while self._running:
             try:
                 incidents = self._check_for_incidents()
@@ -94,6 +113,106 @@ class K8sWatcher:
                     "Watcher error: %s", exc
                 )
                 time.sleep(self.poll_interval)
+
+    def _seed_seen_events(self) -> None:
+        """Mark existing old events as seen on startup.
+
+        This prevents FixIQ from re-investigating
+        incidents that happened before it started.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "kubectl", "get", "events",
+                    "-n", self.namespace,
+                    "--sort-by=.lastTimestamp",
+                    "-o", "json",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+            if result.returncode != 0:
+                return
+
+            data = json.loads(result.stdout)
+            events = data.get("items", [])
+            seeded = 0
+
+            now = datetime.now(timezone.utc)
+
+            for event in events:
+                event_type = event.get("type", "")
+                if event_type != "Warning":
+                    continue
+
+                metadata = event.get("metadata", {})
+                event_id = metadata.get("uid", "")
+                if not event_id:
+                    continue
+
+                # Check event age
+                last_timestamp = event.get(
+                    "lastTimestamp", ""
+                )
+                if last_timestamp:
+                    try:
+                        event_time = datetime.fromisoformat(
+                            last_timestamp.replace(
+                                "Z", "+00:00"
+                            )
+                        )
+                        age = (
+                            now - event_time
+                        ).total_seconds()
+
+                        # Mark old events as seen
+                        if age > STARTUP_EVENT_MAX_AGE:
+                            self._seen_events.add(event_id)
+                            seeded += 1
+                    except Exception:
+                        # If can't parse, mark as seen
+                        self._seen_events.add(event_id)
+                        seeded += 1
+                else:
+                    self._seen_events.add(event_id)
+                    seeded += 1
+
+            if seeded > 0:
+                print(
+                    f"  [Startup] Marked {seeded} old "
+                    f"events as seen — only new incidents "
+                    f"will trigger investigations"
+                )
+
+        except Exception as exc:
+            logger.warning(
+                "Failed to seed seen events: %s", exc
+            )
+
+    def mark_resolved(self, service: str) -> None:
+        """Mark a service as resolved.
+
+        Args:
+            service: Service name that was fixed
+        """
+        self._resolved_services[service] = time.time()
+        logger.info(
+            "Marked %s as resolved for %ds",
+            service,
+            RESOLVED_COOLDOWN,
+        )
+
+    def is_resolved(self, service: str) -> bool:
+        """Check if service was recently resolved."""
+        if service not in self._resolved_services:
+            return False
+        age = time.time() - self._resolved_services[service]
+        if age > RESOLVED_COOLDOWN:
+            del self._resolved_services[service]
+            return False
+        return True
 
     def stop(self) -> None:
         """Stop watching."""
@@ -143,32 +262,51 @@ class K8sWatcher:
         reason = event.get("reason", "")
         event_type = event.get("type", "")
 
-        # Only process Warning events
         if event_type != "Warning":
             return None
 
-        # Check if it's an incident event
         severity = INCIDENT_EVENTS.get(reason)
         if not severity:
             return None
 
-        # Build unique event ID
         metadata = event.get("metadata", {})
         event_id = metadata.get("uid", "")
 
         if not event_id or event_id in self._seen_events:
             return None
 
-        # Mark as seen
+        # Check event age — skip old events
+        last_timestamp = event.get("lastTimestamp", "")
+        if last_timestamp:
+            try:
+                event_time = datetime.fromisoformat(
+                    last_timestamp.replace("Z", "+00:00")
+                )
+                now = datetime.now(timezone.utc)
+                age = (now - event_time).total_seconds()
+
+                # Skip events older than 5 min on startup
+                if self._is_startup and \
+                        age > STARTUP_EVENT_MAX_AGE:
+                    self._seen_events.add(event_id)
+                    return None
+
+            except Exception:
+                pass
+
         self._seen_events.add(event_id)
 
-        # Extract event details
         involved = event.get("involvedObject", {})
         service = involved.get("name", "unknown")
-
-        # Get service name from pod name
-        # e.g. checkout-api-789d77895-kjghv → checkout-api
         service_name = self._extract_service_name(service)
+
+        # Skip recently resolved services
+        if self.is_resolved(service_name):
+            logger.info(
+                "Skipping %s — recently resolved",
+                service_name,
+            )
+            return None
 
         message = event.get("message", "")
         namespace = involved.get(
@@ -179,7 +317,6 @@ class K8sWatcher:
             datetime.now().isoformat()
         )
 
-        # Get pod name
         pod = ""
         if involved.get("kind") == "Pod":
             pod = service
@@ -201,10 +338,10 @@ class K8sWatcher:
     ) -> str:
         """Extract service name from pod name.
 
-        e.g. checkout-api-789d77895-kjghv → checkout-api
+        e.g. checkout-api-789d77895-kjghv
+             → checkout-api
         """
         parts = pod_name.split("-")
-        # Remove last 2 parts (replicaset hash + pod hash)
         if len(parts) > 2:
             return "-".join(parts[:-2])
         return pod_name
@@ -231,7 +368,6 @@ class K8sWatcher:
 
             data = json.loads(result.stdout)
             items = data.get("items", [])
-
             if not items:
                 return {}
 
@@ -239,7 +375,8 @@ class K8sWatcher:
             status = pod.get("status", {})
             spec = pod.get("spec", {})
             containers = spec.get("containers", [{}])
-            container = containers[0] if containers else {}
+            container = containers[0] \
+                if containers else {}
             resources = container.get("resources", {})
             limits = resources.get("limits", {})
             requests = resources.get("requests", {})
@@ -249,7 +386,6 @@ class K8sWatcher:
             )
             cs = container_statuses[0] \
                 if container_statuses else {}
-
             last_state = cs.get("lastState", {})
             terminated = last_state.get("terminated", {})
 
@@ -293,7 +429,6 @@ class K8sWatcher:
         """Get real recent logs from a pod."""
         logs = []
 
-        # Try previous container logs first (crashed)
         for flag in ["--previous", ""]:
             try:
                 cmd = [
@@ -312,11 +447,12 @@ class K8sWatcher:
                     timeout=10,
                 )
 
-                if result.returncode == 0 and result.stdout:
+                if result.returncode == 0 \
+                        and result.stdout:
                     logs = [
-                        l for l in
+                        line for line in
                         result.stdout.strip().split("\n")
-                        if l.strip()
+                        if line.strip()
                     ]
                     break
 
@@ -334,33 +470,29 @@ class K8sWatcher:
         )
         logs = self.get_recent_logs(incident.service)
 
-        # Build structured logs
         structured_logs = []
         for log in logs:
             if any(k in log.lower() for k in [
                 "error", "exception", "failed",
                 "oom", "kill", "crash"
             ]):
-                structured_logs.append(
-                    f"ERROR {log}"
-                )
+                structured_logs.append(f"ERROR {log}")
             elif any(k in log.lower() for k in [
                 "warn", "warning"
             ]):
-                structured_logs.append(
-                    f"WARNING {log}"
-                )
+                structured_logs.append(f"WARNING {log}")
             else:
                 structured_logs.append(log)
 
-        # Add K8s event as log
         structured_logs.append(
             f"CRITICAL k8s_event: {incident.reason} "
             f"- {incident.message}"
         )
 
         return {
-            "title": f"{incident.reason} in {incident.service}",
+            "title": (
+                f"{incident.reason} in {incident.service}"
+            ),
             "message": incident.message,
             "severity": incident.severity,
             "service": incident.service,
@@ -385,9 +517,11 @@ class K8sWatcher:
                 "ready": pod_details.get(
                     "ready", False
                 ),
-                "error_rate_pct": 100
-                if not pod_details.get("ready", False)
-                else 0,
+                "error_rate_pct": (
+                    100 if not pod_details.get(
+                        "ready", False
+                    ) else 0
+                ),
             },
             "logs": structured_logs[:20],
             "pod_details": pod_details,

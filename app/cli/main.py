@@ -10,6 +10,7 @@ Usage:
     fixiq multi -i alerts.json --analyze-top 3
     fixiq watch
     fixiq watch --namespace production
+    fixiq record -s my-service -f "Increased memory" -m 5
 """
 
 from __future__ import annotations
@@ -46,12 +47,11 @@ def cli() -> None:
     \b
     Examples:
       fixiq analyze -i alert.json
-      fixiq analyze -i alert.json --verify
       fixiq analyze -i alert.json --service checkout-api
-      fixiq multi -i alerts.json
       fixiq multi -i alerts.json --analyze-top 3
       fixiq watch
       fixiq watch --namespace production
+      fixiq record -s my-service -f "Increased memory" -m 5
     """
     pass
 
@@ -114,11 +114,13 @@ def analyze_command(
     try:
         alert_data = json.loads(alert_path.read_text())
         console.print(
-            f"\n  Loading alert from [bold]{input_file}[/bold]..."
+            f"\n  Loading alert from "
+            f"[bold]{input_file}[/bold]..."
         )
     except Exception as exc:
         console.print(
-            f"\n  [bold red]Error loading alert:[/bold red] {exc}"
+            f"\n  [bold red]Error loading alert:"
+            f"[/bold red] {exc}"
         )
         return
 
@@ -335,10 +337,12 @@ def watch_command(
 
     \b
     Automatically:
-      1. Detects K8s incidents (OOMKilled, CrashLoop etc.)
-      2. Runs OpenSRE LLM investigation
-      3. Runs FixIQ deep analysis
-      4. Shows unified report
+      1. Discovers all services in cluster
+      2. Detects K8s incidents (OOMKilled, CrashLoop etc.)
+      3. Prioritizes multiple alerts by criticality
+      4. Runs OpenSRE LLM investigation
+      5. Runs FixIQ deep analysis
+      6. Shows unified report with fix commands
 
     \b
     Examples:
@@ -350,10 +354,80 @@ def watch_command(
 
     pipeline = FixIQPipeline(
         namespace=namespace,
-        opensre_path=opensre_path or
-        "/home/sahilx480/opensre",
+        opensre_path=(
+            opensre_path or
+            "/home/sahilx480/opensre"
+        ),
     )
     pipeline.run()
+
+
+@cli.command(name="record")
+@click.option(
+    "--service", "-s",
+    required=True,
+    help="Service name that was fixed.",
+)
+@click.option(
+    "--fix", "-f",
+    required=True,
+    help="What fix was applied.",
+)
+@click.option(
+    "--minutes", "-m",
+    default=15,
+    show_default=True,
+    help="Minutes it took to fix.",
+)
+def record_command(
+    service: str,
+    fix: str,
+    minutes: int,
+) -> None:
+    """Record a fix so FixIQ learns from it.
+
+    \b
+    Teaches FixIQ what works so it recommends
+    the same fix for similar future incidents.
+
+    \b
+    Examples:
+      fixiq record -s restaurant-api -f "Increased memory to 128Mi" -m 5
+      fixiq record -s payment-gateway -f "Fixed config env var" -m 3
+      fixiq record -s order-service -f "Scaled replicas to 3" -m 10
+    """
+    from app.core.similar_incidents import (
+        SimilarIncidentsFinder
+    )
+    from app.core.knowledge_base import KnowledgeBase
+
+    _print_header()
+
+    # Save to similar incidents finder
+    finder = SimilarIncidentsFinder()
+    finder.save_incident(
+        root_cause=f"OOMKilled in {service}",
+        service_name=service,
+        fix_applied=fix,
+        time_to_fix_minutes=minutes,
+        outcome="resolved",
+    )
+
+    # Update knowledge base
+    kb = KnowledgeBase()
+    kb.record_fix(service, fix)
+
+    console.print(
+        f"\n  [bold green]✓[/bold green] "
+        f"Fix recorded for [bold]{service}[/bold]"
+    )
+    console.print(f"  Fix:     {fix}")
+    console.print(f"  Time:    {minutes} minutes")
+    console.print(f"  Outcome: [green]resolved[/green]")
+    console.print(
+        f"\n  [dim]FixIQ will recommend this fix "
+        f"for similar future incidents.[/dim]"
+    )
 
 
 def _print_header() -> None:
@@ -373,9 +447,7 @@ def _print_header() -> None:
     console.print(Rule(style="dim"))
 
 
-def _run_investigation(
-    alert_data: dict
-) -> dict:
+def _run_investigation(alert_data: dict) -> dict:
     """Run OpenSRE investigation."""
     try:
         from opensre.investigate import run_investigation
@@ -472,7 +544,8 @@ def _run_verification(
             "  [yellow]No previous fix found.[/yellow]"
         )
         console.print(
-            "  Run without --verify first to record incident."
+            "  Run without --verify first to "
+            "record incident."
         )
         return
 

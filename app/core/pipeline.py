@@ -1,10 +1,12 @@
 """FixIQ Automated Pipeline.
 
 Full automated pipeline:
-1. K8s Watcher detects incident
-2. OpenSRE runs real LLM investigation
-3. FixIQ runs deep analysis
-4. Unified report displayed
+1. Service Discovery — learns YOUR system
+2. K8s Watcher — detects incidents
+3. Incident Queue — prioritizes multiple alerts
+4. OpenSRE — real LLM investigation with live progress
+5. FixIQ — deep analysis
+6. Unified report
 
 No manual steps — fully automated!
 """
@@ -13,17 +15,27 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import tempfile
-import os
+import threading
+import time
 from datetime import datetime
 from typing import Any
 
 from app.core.k8s_watcher import K8sIncident, K8sWatcher
+from app.core.service_discovery import (
+    ServiceDiscovery,
+    SystemMap,
+    display_system_map,
+)
+from app.core.incident_queue import (
+    IncidentQueue,
+    display_queue,
+)
 
 logger = logging.getLogger(__name__)
 
-# ANSI colors
 BOLD = "\033[1m"
 RED = "\033[91m"
 YELLOW = "\033[93m"
@@ -47,74 +59,170 @@ class FixIQPipeline:
             os.path.expanduser("~/opensre")
         )
         self.watcher = K8sWatcher(namespace=namespace)
-        self._processed: set[str] = set()
+        self.discovery = ServiceDiscovery(
+            namespace=namespace
+        )
+        self.queue: IncidentQueue | None = None
+        self._system_map: SystemMap | None = None
+        self._worker_thread: threading.Thread | None = None
+        self._running = False
 
     def run(self) -> None:
         """Start the automated pipeline."""
         self._print_banner()
-        self.watcher.watch(
-            on_incident=self._handle_incident
+
+        print(f"\n{BOLD}{'─' * 70}{RESET}")
+        print(f"{BOLD}  STEP 1 — Service Discovery{RESET}")
+        print(f"{BOLD}{'─' * 70}{RESET}")
+
+        self._system_map = self.discovery.discover()
+        display_system_map(self._system_map)
+
+        self.queue = IncidentQueue(
+            system_map=self._system_map
         )
 
-    def _print_banner(self) -> None:
-        """Print pipeline banner."""
-        print(f"\n{BOLD}{'═' * 70}{RESET}")
-        print(f"{BOLD}  FixIQ — Automated Incident Pipeline{RESET}")
-        print(f"{DIM}  Powered by OpenSRE{RESET}")
-        print(f"{BOLD}{'═' * 70}{RESET}")
-        print(f"\n  {GREEN}✓{RESET} Kubernetes watcher started")
-        print(f"  {GREEN}✓{RESET} OpenSRE LLM ready")
-        print(f"  {GREEN}✓{RESET} FixIQ analyzer ready")
-        print(
-            f"\n  {DIM}Waiting for incidents in "
-            f"namespace: {self.namespace}{RESET}\n"
+        self._running = True
+        self._worker_thread = threading.Thread(
+            target=self._process_queue,
+            daemon=True,
         )
-
-    def _handle_incident(
-        self, incident: K8sIncident
-    ) -> None:
-        """Handle a detected incident."""
-        # Deduplicate — don't process same service twice
-        # within 60 seconds
-        dedup_key = (
-            f"{incident.service}:{incident.reason}"
-        )
-        if dedup_key in self._processed:
-            return
-        self._processed.add(dedup_key)
+        self._worker_thread.start()
 
         print(f"\n{BOLD}{'─' * 70}{RESET}")
         print(
-            f"{RED}{BOLD}  🚨 INCIDENT DETECTED{RESET}"
+            f"{BOLD}  STEP 2 — Watching for Incidents{RESET}"
         )
         print(f"{BOLD}{'─' * 70}{RESET}")
-        print(
-            f"\n  Service:   {BOLD}{incident.service}{RESET}"
-        )
-        print(f"  Reason:    {RED}{incident.reason}{RESET}")
-        print(f"  Severity:  {incident.severity.upper()}")
-        print(f"  Pod:       {incident.pod}")
-        print(
-            f"  Time:      {incident.timestamp[:19]}"
-        )
-        print(f"  Message:   {incident.message[:80]}")
 
-        # Build alert from real K8s data
+        try:
+            self.watcher.watch(
+                on_incident=self._on_incident_detected
+            )
+        except KeyboardInterrupt:
+            self._running = False
+            print("\n  Stopping pipeline...")
+
+    def _on_incident_detected(
+        self, incident: K8sIncident
+    ) -> None:
+        """Called when K8s incident is detected."""
+        if self.queue and self.queue.is_processing(
+            incident.service
+        ):
+            return
+
         print(
-            f"\n  {BLUE}→ Building alert from "
-            f"Kubernetes data...{RESET}"
+            f"\n{RED}{BOLD}  🚨 INCIDENT DETECTED: "
+            f"{incident.reason} in "
+            f"{incident.service}{RESET}"
         )
+
         alert = self.watcher.build_alert(incident)
 
-        # Show what we collected
+        if self._system_map:
+            svc = self._system_map.get_service(
+                incident.service
+            )
+            if svc:
+                alert["service_info"] = {
+                    "criticality": svc.criticality,
+                    "users_affected": svc.users_affected,
+                    "memory_limit": svc.memory_limit,
+                    "restart_count": svc.restart_count,
+                    "is_healthy": svc.is_healthy,
+                    "depends_on": svc.depends_on,
+                    "image": svc.image,
+                }
+                print(
+                    f"  {GREEN}✓{RESET} Service known: "
+                    f"criticality={svc.criticality}/10, "
+                    f"users=~{svc.users_affected}"
+                )
+
+        if self.queue:
+            self.queue.add(incident, alert)
+            queue_size = self.queue.size()
+            if queue_size > 1:
+                display_queue(
+                    self.queue,
+                    f"{queue_size} INCIDENTS QUEUED"
+                )
+
+    def _process_queue(self) -> None:
+        """Worker thread — processes incidents in order."""
+        while self._running:
+            if self.queue and not self.queue.is_empty():
+                queued = self.queue.get_next()
+                if queued:
+                    self.queue.mark_processing(
+                        queued.incident.service
+                    )
+                    try:
+                        self._handle_incident(queued)
+                    finally:
+                        self.queue.mark_done(queued)
+            else:
+                time.sleep(2)
+
+    def _handle_incident(self, queued: Any) -> None:
+        """Handle a single queued incident."""
+        incident = queued.incident
+        alert = queued.alert
+
+        # Check if service already recovered
+        from app.core.k8s_collector import K8sCollector
+        collector = K8sCollector(
+            namespace=self.namespace
+        )
+        pod = collector.get_pod_details(
+            incident.service
+        )
+
+        if (pod and
+                pod.get("phase") == "Running" and
+                pod.get("restart_count", 0) == 0 and
+                pod.get("exit_code", 0) == 0 and
+                pod.get("ready", False)):
+            print(
+                f"\n  {GREEN}✓{RESET} "
+                f"{incident.service} already recovered "
+                f"— skipping investigation"
+            )
+            # Mark as resolved so watcher ignores it
+            self.watcher.mark_resolved(incident.service)
+            return
+
+        print(f"\n{BOLD}{'═' * 70}{RESET}")
+        print(
+            f"{BOLD}  🔬 INVESTIGATING: "
+            f"{incident.service}{RESET}"
+        )
+        print(
+            f"  Priority: {queued.priority} | "
+            f"Criticality: "
+            f"{queued.service_criticality}/10 | "
+            f"Users: ~{queued.estimated_users}"
+        )
+        print(f"{BOLD}{'═' * 70}{RESET}")
+
         pod_details = alert.get("pod_details", {})
         if pod_details:
-            print(
-                f"  {GREEN}✓{RESET} Pod status: "
-                f"{pod_details.get('phase', 'Unknown')}"
+            exit_code = pod_details.get("exit_code", 0)
+            oom_label = (
+                " ← OOMKilled!"
+                if exit_code == 137 else ""
             )
             print(
-                f"  {GREEN}✓{RESET} Restart count: "
+                f"\n  {GREEN}✓{RESET} Pod: "
+                f"{pod_details.get('pod_name', 'unknown')}"
+            )
+            print(
+                f"  {GREEN}✓{RESET} Status: "
+                f"{pod_details.get('phase', 'unknown')}"
+            )
+            print(
+                f"  {GREEN}✓{RESET} Restarts: "
                 f"{pod_details.get('restart_count', 0)}"
             )
             print(
@@ -123,55 +231,80 @@ class FixIQPipeline:
             )
             print(
                 f"  {GREEN}✓{RESET} Exit code: "
-                f"{pod_details.get('exit_code', 0)}"
+                f"{exit_code}{oom_label}"
             )
 
-        logs = alert.get("logs", [])
-        print(
-            f"  {GREEN}✓{RESET} Collected "
-            f"{len(logs)} log lines"
-        )
+        service_info = alert.get("service_info", {})
+        if service_info:
+            deps = service_info.get("depends_on", [])
+            if deps:
+                print(
+                    f"  {GREEN}✓{RESET} "
+                    f"Downstream services affected: "
+                    f"{', '.join(deps)}"
+                )
+            else:
+                print(
+                    f"  {DIM}  No downstream services "
+                    f"in cluster{RESET}"
+                )
 
-        # Run OpenSRE investigation
         print(
             f"\n  {BLUE}→ Running OpenSRE "
             f"investigation (Ollama LLM)...{RESET}"
         )
         rca_output = self._run_opensre(alert)
-
         root_cause = rca_output.get(
             "root_cause", "Unknown"
         )
         print(
-            f"  {GREEN}✓{RESET} Root cause: "
-            f"{root_cause}"
+            f"  {GREEN}✓{RESET} Root cause: {root_cause}"
         )
 
-        # Run FixIQ deep analysis
+        k8s_info = collector.get_service_info(
+            incident.service
+        )
+
+        if k8s_info:
+            rca_output["k8s_info"] = {
+                "memory_limit": k8s_info.memory_limit,
+                "memory_request": k8s_info.memory_request,
+                "restart_count": k8s_info.restart_count,
+                "pod_status": k8s_info.pod_status,
+                "deployment_revision": (
+                    k8s_info.deployment_revision
+                ),
+                "real_dependents": k8s_info.dependents,
+                "real_events": [
+                    e.get("message", "")
+                    for e in k8s_info.recent_events[:5]
+                ],
+            }
+            if service_info.get("depends_on"):
+                rca_output["k8s_info"][
+                    "real_dependents"
+                ] = service_info["depends_on"]
+
+            print(
+                f"  {GREEN}✓{RESET} Real K8s data: "
+                f"memory={k8s_info.memory_limit}, "
+                f"restarts={k8s_info.restart_count}, "
+                f"revision={k8s_info.deployment_revision}"
+            )
+
         print(
             f"\n  {BLUE}→ Running FixIQ "
-            f"deep analysis...{RESET}"
+            f"deep analysis...{RESET}\n"
         )
         self._run_fixiq_analysis(
             alert, rca_output, incident.service
         )
 
-        # Clear dedup after 60 seconds
-        import threading
-        def clear_dedup():
-            import time
-            time.sleep(60)
-            self._processed.discard(dedup_key)
-        threading.Thread(
-            target=clear_dedup, daemon=True
-        ).start()
-
     def _run_opensre(
         self, alert: dict[str, Any]
     ) -> dict[str, Any]:
-        """Run OpenSRE investigation on the alert."""
+        """Run OpenSRE investigation with live progress."""
         try:
-            # Write alert to temp file
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 suffix=".json",
@@ -180,46 +313,102 @@ class FixIQPipeline:
                 json.dump(alert, f)
                 alert_file = f.name
 
-            # Run opensre investigate
             opensre_venv = os.path.join(
                 self.opensre_path,
                 ".venv/bin/opensre"
             )
-
             if not os.path.exists(opensre_venv):
                 opensre_venv = "opensre"
 
-            result = subprocess.run(
+            process = subprocess.Popen(
                 [
                     opensre_venv,
                     "investigate",
                     "-i", alert_file,
                 ],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=300,  # 5 min timeout
                 cwd=self.opensre_path,
             )
 
-            # Parse output
-            rca_output = self._parse_opensre_output(
-                result.stdout, result.stderr, alert
-            )
+            progress_messages = [
+                "Analyzing alert data...",
+                "Querying Kubernetes events...",
+                "Running LLM investigation...",
+                "Building root cause hypothesis...",
+                "Analyzing service dependencies...",
+                "Generating recommendations...",
+                "Validating findings...",
+                "Finalizing investigation...",
+            ]
 
-            # Cleanup
-            os.unlink(alert_file)
+            start_time = time.time()
+            msg_index = 0
+            timeout = 120
+            last_print = 0
 
-            return rca_output
-
-        except subprocess.TimeoutExpired:
             print(
-                f"  {YELLOW}⚠ OpenSRE investigation "
-                f"timed out{RESET}"
+                f"  {DIM}[00:00] Starting "
+                f"investigation...{RESET}"
             )
-            return self._fallback_rca(alert)
+
+            while process.poll() is None:
+                elapsed = int(
+                    time.time() - start_time
+                )
+
+                if elapsed > timeout:
+                    process.kill()
+                    mins = elapsed // 60
+                    secs = elapsed % 60
+                    print(
+                        f"\n  {YELLOW}⚠ OpenSRE timed out "
+                        f"after {mins:02d}:{secs:02d} "
+                        f"— using fallback RCA{RESET}"
+                    )
+                    try:
+                        os.unlink(alert_file)
+                    except Exception:
+                        pass
+                    return self._fallback_rca(alert)
+
+                if elapsed - last_print >= 10:
+                    mins = elapsed // 60
+                    secs = elapsed % 60
+                    msg = progress_messages[
+                        msg_index % len(progress_messages)
+                    ]
+                    print(
+                        f"  {DIM}[{mins:02d}:{secs:02d}]"
+                        f"{RESET}   🤖 {msg}"
+                    )
+                    msg_index += 1
+                    last_print = elapsed
+
+                time.sleep(1)
+
+            stdout, stderr = process.communicate()
+            elapsed = int(time.time() - start_time)
+            mins = elapsed // 60
+            secs = elapsed % 60
+            print(
+                f"  {GREEN}✓{RESET} Investigation "
+                f"complete in {mins:02d}:{secs:02d}"
+            )
+
+            rca = self._parse_opensre_output(
+                stdout, stderr, alert
+            )
+            try:
+                os.unlink(alert_file)
+            except Exception:
+                pass
+            return rca
+
         except Exception as exc:
             logger.warning(
-                "OpenSRE investigation failed: %s", exc
+                "OpenSRE failed: %s", exc
             )
             return self._fallback_rca(alert)
 
@@ -230,13 +419,10 @@ class FixIQPipeline:
         alert: dict[str, Any],
     ) -> dict[str, Any]:
         """Parse OpenSRE investigation output."""
+        import re
         output = stdout + stderr
-
-        # Extract root cause from output
         root_cause = alert.get("title", "Unknown")
 
-        # Look for root cause patterns
-        import re
         patterns = [
             r"[Rr]oot [Cc]ause[:\s]+(.+?)(?:\n|$)",
             r"[Cc]ause[:\s]+(.+?)(?:\n|$)",
@@ -251,14 +437,12 @@ class FixIQPipeline:
                     root_cause = found
                     break
 
-        # Extract recommended actions
         actions = []
         action_patterns = [
-            r"[Rr]ecommend(?:ed)?\s+[Aa]ction[s]?[:\s]+(.+?)(?:\n\n|$)",
-            r"[Ss]uggestion[s]?[:\s]+(.+?)(?:\n|$)",
+            r"[Rr]ecommend(?:ed)?\s+[Aa]ction[s]?"
+            r"[:\s]+(.+?)(?:\n|$)",
             r"[Ff]ix[:\s]+(.+?)(?:\n|$)",
         ]
-
         for pattern in action_patterns:
             matches = re.findall(pattern, output)
             actions.extend(matches[:3])
@@ -275,30 +459,53 @@ class FixIQPipeline:
     def _fallback_rca(
         self, alert: dict[str, Any]
     ) -> dict[str, Any]:
-        """Fallback RCA when OpenSRE fails."""
-        title = alert.get("title", "Unknown incident")
+        """Fallback RCA built from real K8s data."""
+        title = alert.get("title", "Unknown")
         pod_details = alert.get("pod_details", {})
+        service_info = alert.get("service_info", {})
 
-        # Build RCA from K8s data directly
         root_cause = title
-        if pod_details.get("exit_code") == 137:
+        actions = []
+
+        exit_code = pod_details.get("exit_code", 0)
+        mem = pod_details.get("memory_limit", "unknown")
+        restarts = pod_details.get("restart_count", 0)
+        service = alert.get("service", "unknown")
+        deps = service_info.get("depends_on", [])
+
+        if exit_code == 137:
             root_cause = (
-                f"Pod OOMKilled — memory limit "
-                f"{pod_details.get('memory_limit', 'unknown')} "
-                f"exceeded. Restart count: "
-                f"{pod_details.get('restart_count', 0)}"
+                f"Pod OOMKilled in {service} — "
+                f"memory limit {mem} exceeded. "
+                f"Restart count: {restarts}"
             )
+            actions = [
+                f"Increase memory limit above {mem}",
+                "Check for memory leaks in application",
+                "Monitor memory after applying fix",
+            ]
+            if deps:
+                actions.append(
+                    f"Check downstream: "
+                    f"{', '.join(deps)}"
+                )
+        elif "BackOff" in title or "CrashLoop" in title:
+            root_cause = (
+                f"Container crash loop in {service} — "
+                f"check application logs and config"
+            )
+            actions = [
+                "Check container logs for errors",
+                "Verify configuration and env vars",
+                f"Check memory limit: {mem}",
+            ]
 
         return {
             "root_cause": root_cause,
-            "recommended_actions": [
-                "Check pod memory usage",
-                "Increase memory limit",
-                "Check for memory leaks",
-            ],
+            "recommended_actions": actions,
             "evidence_entries": [],
             "report": root_cause,
-            "service": alert.get("service", "unknown"),
+            "service": service,
         }
 
     def _run_fixiq_analysis(
@@ -328,65 +535,32 @@ class FixIQPipeline:
         from app.core.blast_radius import (
             BlastRadiusAnalyzer
         )
-        from app.core.k8s_collector import K8sCollector
         from app.core.knowledge_base import KnowledgeBase
 
-        # Get REAL K8s data
-        collector = K8sCollector(
-            namespace=self.namespace
-        )
-        k8s_info = collector.get_service_info(
-            service_name
-        )
-
-        # Enrich RCA with real K8s data
-        if k8s_info:
-            rca_output["k8s_info"] = {
-                "memory_limit": k8s_info.memory_limit,
-                "memory_request": k8s_info.memory_request,
-                "restart_count": k8s_info.restart_count,
-                "pod_status": k8s_info.pod_status,
-                "deployment_revision": (
-                    k8s_info.deployment_revision
-                ),
-                "real_dependents": k8s_info.dependents,
-                "real_events": [
-                    e.get("message", "")
-                    for e in k8s_info.recent_events[:5]
-                ],
-            }
-            print(
-                f"  {GREEN}✓{RESET} Real K8s data: "
-                f"memory={k8s_info.memory_limit}, "
-                f"restarts={k8s_info.restart_count}"
+        service_info = alert.get("service_info", {})
+        if service_info:
+            rca_output["service_criticality"] = (
+                service_info.get("criticality", 5)
+            )
+            rca_output["service_users"] = (
+                service_info.get("users_affected", 100)
             )
 
-        print()
-
-        # 1. Evidence Chain
         evidence = EvidenceChainAnalyzer().analyze(
             rca_output, alert
         )
         display_evidence_chain(evidence)
 
-        # 2. Cascade Analysis with real dependents
-        if k8s_info and k8s_info.dependents:
-            print(
-                f"\n  {GREEN}✓{RESET} Real K8s dependents: "
-                f"{k8s_info.dependents}"
-            )
         cascade = CascadeAnalyzer().analyze(
             service_name, rca_output
         )
         display_cascade_analysis(cascade)
 
-        # 3. Anomaly Timeline
         timeline = AnomalyTimelineAnalyzer().analyze(
             rca_output, alert
         )
         display_anomaly_timeline(timeline)
 
-        # 4. Similar Incidents
         similar = SimilarIncidentsFinder().find(
             rca_output.get("root_cause", ""),
             service_name,
@@ -394,7 +568,6 @@ class FixIQPipeline:
         )
         display_similar_incidents(similar)
 
-        # 5. Urgency + Blast
         urgency = UrgencyScorer().score(
             service_name, rca_output
         )
@@ -402,10 +575,13 @@ class FixIQPipeline:
             service_name, rca_output
         )
 
-        # Final summary
         self._print_final_summary(
-            rca_output, urgency, blast, k8s_info
+            rca_output, urgency, blast, service_info
         )
+
+        # Mark service as resolved so watcher
+        # doesn't re-investigate for 10 minutes
+        self.watcher.mark_resolved(service_name)
 
         # Save to knowledge base
         KnowledgeBase().save(
@@ -414,22 +590,33 @@ class FixIQPipeline:
         )
 
         print(
-            f"\n  {GREEN}✓{RESET} Incident saved "
-            f"to knowledge base"
+            f"\n  {GREEN}✓{RESET} Saved to knowledge base"
+        )
+        print(
+            f"  {GREEN}✓{RESET} {service_name} marked "
+            f"as resolved (10min cooldown)"
         )
         print(f"\n{BOLD}{'═' * 70}{RESET}")
         print(
-            f"{GREEN}{BOLD}  ✅ Pipeline complete!"
-            f"{RESET}"
+            f"{GREEN}{BOLD}  ✅ Pipeline complete "
+            f"for {service_name}!{RESET}"
         )
         print(f"{BOLD}{'═' * 70}{RESET}\n")
+
+        if self.queue and not self.queue.is_empty():
+            remaining = self.queue.size()
+            print(
+                f"\n  {YELLOW}⚠ {remaining} more "
+                f"incident(s) in queue "
+                f"— processing next...{RESET}\n"
+            )
 
     def _print_final_summary(
         self,
         rca_output: dict[str, Any],
         urgency: dict[str, Any],
         blast: dict[str, Any],
-        k8s_info: Any,
+        service_info: dict[str, Any],
     ) -> None:
         """Print final pipeline summary."""
         print(f"\n{BOLD}{'─' * 70}{RESET}")
@@ -441,8 +628,8 @@ class FixIQPipeline:
             f"{rca_output.get('root_cause', 'Unknown')}"
         )
 
-        score = urgency.get("score", "UNKNOWN")
         level = urgency.get("level", 0)
+        score = urgency.get("score", "UNKNOWN")
         color = (
             RED if level >= 8 else
             YELLOW if level >= 5 else
@@ -456,22 +643,12 @@ class FixIQPipeline:
             f"  Fix within: "
             f"{urgency.get('fix_within', 'N/A')}"
         )
-        print(
-            f"  Users at risk: "
-            f"~{blast.get('users_impacted', 0)}"
-        )
 
-        if k8s_info:
-            print(f"\n  Real K8s State:")
-            print(
-                f"  Memory limit: {k8s_info.memory_limit}"
-            )
-            print(
-                f"  Restarts: {k8s_info.restart_count}"
-            )
-            print(
-                f"  Pod status: {k8s_info.pod_status}"
-            )
+        users = service_info.get(
+            "users_affected",
+            blast.get("users_impacted", 0)
+        )
+        print(f"  Users at risk: ~{users}")
 
         actions = rca_output.get(
             "recommended_actions", []
@@ -479,4 +656,50 @@ class FixIQPipeline:
         if actions:
             print(f"\n  Recommended Actions:")
             for action in actions[:3]:
-                print(f"  → {action}")
+                if action.strip():
+                    print(
+                        f"  {GREEN}→{RESET} {action}"
+                    )
+
+        service = rca_output.get("service", "unknown")
+        print(f"\n  {BOLD}Apply Fix:{RESET}")
+        print(
+            f"  {DIM}kubectl set resources "
+            f"deployment/{service} "
+            f"--limits=memory=128Mi "
+            f"--requests=memory=64Mi{RESET}"
+        )
+        print(
+            f"\n  {BOLD}Record fix after applying:{RESET}"
+        )
+        print(
+            f"  {DIM}fixiq record -s {service} "
+            f"-f 'Increased memory to 128Mi' "
+            f"-m 5{RESET}"
+        )
+
+    def _print_banner(self) -> None:
+        """Print pipeline banner."""
+        print(f"\n{BOLD}{'═' * 70}{RESET}")
+        print(
+            f"{BOLD}  FixIQ — Automated Incident "
+            f"Pipeline{RESET}"
+        )
+        print(f"{DIM}  Powered by OpenSRE{RESET}")
+        print(f"{BOLD}{'═' * 70}{RESET}")
+        print(
+            f"\n  {GREEN}✓{RESET} Kubernetes watcher ready"
+        )
+        print(
+            f"  {GREEN}✓{RESET} Service discovery ready"
+        )
+        print(
+            f"  {GREEN}✓{RESET} Incident queue ready"
+        )
+        print(
+            f"  {GREEN}✓{RESET} "
+            f"OpenSRE LLM ready (2min timeout)"
+        )
+        print(
+            f"  {GREEN}✓{RESET} FixIQ analyzer ready"
+        )

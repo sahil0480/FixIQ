@@ -3,8 +3,8 @@
 Analyzes how a failure cascades through your system.
 Shows the full chain of failures and what to fix FIRST.
 
-Most incidents are NOT single failures.
-They're cascades where one failure triggers another.
+Uses REAL Kubernetes data when available,
+falls back to hardcoded map otherwise.
 """
 
 from __future__ import annotations
@@ -22,9 +22,9 @@ class CascadeLevel:
     level: int
     service: str
     failure: str
-    severity: str        # CRITICAL, HIGH, MEDIUM, LOW
-    triggered_by: str    # What caused this level
-    recovery: str        # How to fix this level
+    severity: str
+    triggered_by: str
+    recovery: str
 
 
 @dataclass
@@ -37,8 +37,7 @@ class CascadeAnalysis:
     summary: str
 
 
-# Service dependency graph
-# Shows which services depend on which
+# Fallback hardcoded service dependency graph
 SERVICE_GRAPH: dict[str, list[str]] = {
     "database": [
         "checkout-api",
@@ -121,6 +120,9 @@ class CascadeAnalyzer:
     ) -> CascadeAnalysis:
         """Analyze cascade failure from a service.
 
+        Uses real K8s dependents if available,
+        falls back to hardcoded map otherwise.
+
         Args:
             service_name: Name of the root failing service
             rca_output: RCA output from OpenSRE
@@ -128,30 +130,42 @@ class CascadeAnalyzer:
         Returns:
             Complete cascade analysis
         """
-        root_cause = rca_output.get("root_cause", "").lower()
+        root_cause = rca_output.get(
+            "root_cause", ""
+        ).lower()
 
-        # Identify failure type
-        failure_type = self._identify_failure_type(root_cause)
+        failure_type = self._identify_failure_type(
+            root_cause
+        )
         pattern = FAILURE_PATTERNS.get(
             failure_type, FAILURE_PATTERNS["config"]
         )
 
+        # Get REAL K8s dependents if available
+        real_dependents = rca_output.get(
+            "k8s_info", {}
+        ).get("real_dependents", None)
+
         # Build cascade levels
         levels = self._build_cascade_levels(
-            service_name, pattern, root_cause
+            service_name,
+            pattern,
+            root_cause,
+            real_dependents,
         )
 
-        # Determine fix order
         fix_order = self._determine_fix_order(levels)
-
-        # Build summary
         summary = self._build_summary(
-            service_name, levels, failure_type
+            service_name, levels, failure_type,
+            real_dependents is not None
         )
 
         logger.info(
-            "Cascade analysis: %d levels, root=%s",
-            len(levels), service_name
+            "Cascade analysis: %d levels, root=%s, "
+            "real_k8s=%s",
+            len(levels),
+            service_name,
+            real_dependents is not None,
         )
 
         return CascadeAnalysis(
@@ -167,15 +181,23 @@ class CascadeAnalyzer:
     ) -> str:
         """Identify the type of failure."""
         keywords = {
-            "memory": ["memory", "oom", "oomkilled", "heap"],
+            "memory": [
+                "memory", "oom", "oomkilled", "heap"
+            ],
             "cpu": ["cpu", "throttl", "processor"],
             "database": [
-                "database", "db", "connection", "pool",
-                "postgres", "mysql", "mongo"
+                "database", "db", "connection",
+                "pool", "postgres", "mysql", "mongo"
             ],
-            "network": ["network", "dns", "connect", "timeout"],
-            "config": ["config", "env", "variable", "secret"],
-            "timeout": ["timeout", "latency", "slow", "response"],
+            "network": [
+                "network", "dns", "connect", "timeout"
+            ],
+            "config": [
+                "config", "env", "variable", "secret"
+            ],
+            "timeout": [
+                "timeout", "latency", "slow", "response"
+            ],
         }
 
         for failure_type, words in keywords.items():
@@ -189,11 +211,16 @@ class CascadeAnalyzer:
         root_service: str,
         pattern: dict[str, str],
         root_cause: str,
+        real_dependents: list[str] | None = None,
     ) -> list[CascadeLevel]:
-        """Build cascade levels from root service."""
+        """Build cascade levels from root service.
+
+        Uses real K8s dependents if available,
+        falls back to hardcoded SERVICE_GRAPH.
+        """
         levels = []
 
-        # Level 0 — Root service
+        # Level 0 — Root service (always)
         levels.append(CascadeLevel(
             level=0,
             service=root_service,
@@ -203,35 +230,94 @@ class CascadeAnalyzer:
             recovery=pattern["recovery"],
         ))
 
-        # Level 1 — Direct dependents
-        direct_deps = SERVICE_GRAPH.get(root_service, [])
-        for i, dep in enumerate(direct_deps[:3]):
-            levels.append(CascadeLevel(
-                level=1,
-                service=dep,
-                failure=f"{pattern['cascade']} in {dep}",
-                severity="HIGH",
-                triggered_by=root_service,
-                recovery=f"Will recover after {root_service} is fixed",
-            ))
-
-        # Level 2 — Secondary dependents
-        for dep in direct_deps[:2]:
-            secondary = SERVICE_GRAPH.get(dep, [])
-            for sec in secondary[:2]:
-                # Avoid duplicates
-                existing = [l.service for l in levels]
-                if sec not in existing:
+        # Use REAL K8s dependents if available
+        if real_dependents is not None:
+            if real_dependents:
+                # Real dependents found in cluster
+                for dep in real_dependents[:5]:
                     levels.append(CascadeLevel(
-                        level=2,
-                        service=sec,
-                        failure=f"Degraded due to {dep} failure",
-                        severity="MEDIUM",
-                        triggered_by=dep,
+                        level=1,
+                        service=dep,
+                        failure=(
+                            f"{pattern['cascade']} in {dep}"
+                        ),
+                        severity="HIGH",
+                        triggered_by=root_service,
                         recovery=(
-                            f"Will recover after {dep} recovers"
+                            f"Will recover after "
+                            f"{root_service} is fixed"
                         ),
                     ))
+            else:
+                # Real K8s data available but no dependents
+                levels.append(CascadeLevel(
+                    level=1,
+                    service="No dependent services",
+                    failure=(
+                        "No other services depend on "
+                        f"{root_service} in this cluster"
+                    ),
+                    severity="LOW",
+                    triggered_by=root_service,
+                    recovery=(
+                        "Only this service needs fixing"
+                    ),
+                ))
+        else:
+            # Fallback to hardcoded SERVICE_GRAPH
+            direct_deps = SERVICE_GRAPH.get(
+                root_service, []
+            )
+
+            if direct_deps:
+                for dep in direct_deps[:3]:
+                    levels.append(CascadeLevel(
+                        level=1,
+                        service=dep,
+                        failure=(
+                            f"{pattern['cascade']} in {dep}"
+                        ),
+                        severity="HIGH",
+                        triggered_by=root_service,
+                        recovery=(
+                            f"Will recover after "
+                            f"{root_service} is fixed"
+                        ),
+                    ))
+
+                # Level 2 — Secondary dependents
+                for dep in direct_deps[:2]:
+                    secondary = SERVICE_GRAPH.get(dep, [])
+                    for sec in secondary[:2]:
+                        existing = [
+                            l.service for l in levels
+                        ]
+                        if sec not in existing:
+                            levels.append(CascadeLevel(
+                                level=2,
+                                service=sec,
+                                failure=(
+                                    f"Degraded due to "
+                                    f"{dep} failure"
+                                ),
+                                severity="MEDIUM",
+                                triggered_by=dep,
+                                recovery=(
+                                    f"Will recover after "
+                                    f"{dep} recovers"
+                                ),
+                            ))
+            else:
+                levels.append(CascadeLevel(
+                    level=1,
+                    service="No known dependents",
+                    failure="Impact unknown",
+                    severity="LOW",
+                    triggered_by=root_service,
+                    recovery=(
+                        "Check service dependencies manually"
+                    ),
+                ))
 
         return levels
 
@@ -239,7 +325,6 @@ class CascadeAnalyzer:
         self, levels: list[CascadeLevel]
     ) -> list[str]:
         """Determine the order to fix services."""
-        # Always fix root cause first
         order = []
         seen = set()
 
@@ -257,17 +342,28 @@ class CascadeAnalyzer:
         root_service: str,
         levels: list[CascadeLevel],
         failure_type: str,
+        real_data: bool = False,
     ) -> str:
         """Build human readable summary."""
         affected = len(levels)
-        critical = sum(1 for l in levels if l.severity == "CRITICAL")
-        high = sum(1 for l in levels if l.severity == "HIGH")
+        critical = sum(
+            1 for l in levels if l.severity == "CRITICAL"
+        )
+        high = sum(
+            1 for l in levels if l.severity == "HIGH"
+        )
+
+        data_source = (
+            "real K8s data" if real_data
+            else "estimated from service graph"
+        )
 
         return (
-            f"{failure_type.upper()} failure in {root_service} "
-            f"cascaded to {affected} services "
-            f"({critical} critical, {high} high severity). "
-            f"Fix {root_service} first to stop the cascade."
+            f"{failure_type.upper()} failure in "
+            f"{root_service} — {affected} services "
+            f"affected ({critical} critical, {high} high). "
+            f"Fix {root_service} first. "
+            f"[Source: {data_source}]"
         )
 
 
@@ -279,6 +375,7 @@ def display_cascade_analysis(
     RED = "\033[91m"
     YELLOW = "\033[93m"
     BLUE = "\033[94m"
+    GREEN = "\033[92m"
     DIM = "\033[2m"
     RESET = "\033[0m"
 
@@ -293,12 +390,14 @@ def display_cascade_analysis(
         color = (
             RED if level.severity == "CRITICAL" else
             YELLOW if level.severity == "HIGH" else
-            BLUE
+            BLUE if level.severity == "MEDIUM" else
+            GREEN
         )
         arrow = "→" if level.level > 0 else "●"
 
         print(
-            f"\n  {indent}{arrow} [{color}{level.severity}{RESET}] "
+            f"\n  {indent}{arrow} "
+            f"[{color}{level.severity}{RESET}] "
             f"{BOLD}{level.service}{RESET}"
         )
         print(f"  {indent}  {level.failure}")
