@@ -90,35 +90,23 @@ class AnomalyTimelineAnalyzer:
         rca_output: dict[str, Any],
         alert_data: dict[str, Any],
     ) -> AnomalyTimeline:
-        """Build anomaly timeline.
-
-        Args:
-            rca_output: RCA output from OpenSRE
-            alert_data: Original alert data
-
-        Returns:
-            Complete anomaly timeline
-        """
+        """Build anomaly timeline."""
         root_cause = rca_output.get("root_cause", "").lower()
 
-        # Extract metrics from alert and RCA
         anomalies = self._extract_anomalies(
             root_cause, rca_output, alert_data
         )
 
-        # Find first failing metric
         first_metric = self._find_first_anomaly(anomalies)
 
-        # Calculate detection lag
         alert_time = self._extract_alert_time(alert_data)
         first_anomaly_time = self._estimate_first_anomaly_time(
-            alert_time, anomalies
+            alert_time, anomalies, alert_data
         )
         detection_lag = self._calculate_detection_lag(
             first_anomaly_time, alert_time
         )
 
-        # Build summary
         summary = self._build_summary(
             anomalies, first_metric, detection_lag
         )
@@ -140,16 +128,40 @@ class AnomalyTimelineAnalyzer:
             summary=summary,
         )
 
+    def _parse_memory_mi(self, value: str) -> float | None:
+        """Parse a K8s memory string into MiB float.
+
+        Handles: 5Mi, 128Mi, 1Gi, 512M, 1G
+        Returns None if unparseable.
+        """
+        if not value or value == "unknown":
+            return None
+        v = value.strip()
+        try:
+            if v.endswith("Gi"):
+                return float(v[:-2]) * 1024
+            elif v.endswith("Mi"):
+                return float(v[:-2])
+            elif v.endswith("G"):
+                return float(v[:-1]) * 1024
+            elif v.endswith("M"):
+                return float(v[:-1])
+            elif v.endswith("Ki"):
+                return float(v[:-2]) / 1024
+            else:
+                return float(v)
+        except ValueError:
+            return None
+
     def _extract_anomalies(
         self,
         root_cause: str,
         rca_output: dict[str, Any],
         alert_data: dict[str, Any],
     ) -> list[MetricAnomaly]:
-        """Extract metric anomalies from data."""
+        """Extract metric anomalies using real K8s data."""
         anomalies = []
 
-        # Map root cause keywords to metrics
         metric_keywords = {
             "cpu": ["cpu", "processor", "throttl"],
             "memory": ["memory", "oom", "heap", "ram"],
@@ -160,16 +172,99 @@ class AnomalyTimelineAnalyzer:
         }
 
         detected_metrics = set()
-
         for metric, keywords in metric_keywords.items():
             if any(k in root_cause for k in keywords):
                 detected_metrics.add(metric)
 
-        # Always include error_rate if there's an incident
+        # Always include error_rate for any incident
         detected_metrics.add("error_rate")
 
-        # Build anomaly objects
+        # Pull real values from alert_data.
+        # Keys may be at top level, in pod_details, or service_info.
+        pod_details = alert_data.get("pod_details", {})
+        service_info = alert_data.get("service_info", {})
+
+        memory_limit_str = (
+            pod_details.get("memory_limit")
+            or service_info.get("memory_limit")
+            or alert_data.get("memory_limit", "")
+        )
+        restart_count = int(
+            pod_details.get("restart_count")
+            or service_info.get("restart_count")
+            or alert_data.get("restart_count", 0)
+        )
+        exit_code = (
+            pod_details.get("exit_code")
+            or alert_data.get("exit_code", 0)
+        )
+        is_oomkilled = (exit_code == 137)
+
+        memory_limit_mi = self._parse_memory_mi(
+            memory_limit_str
+        )
+
         for i, metric in enumerate(detected_metrics):
+
+            if metric == "memory" and memory_limit_mi is not None:
+                # Normal = 50% of limit (healthy pod usage estimate)
+                normal_mi = round(memory_limit_mi * 0.5, 1)
+                current_mi = memory_limit_mi  # hit the wall
+
+                change_pct = round(
+                    (current_mi - normal_mi) / normal_mi * 100
+                    if normal_mi > 0 else 0,
+                    1,
+                )
+
+                def fmt_mem(mi: float) -> str:
+                    if mi >= 1024:
+                        return f"{mi/1024:.1f}Gi"
+                    return f"{mi:.0f}Mi"
+
+                anomalies.append(MetricAnomaly(
+                    metric="memory",
+                    normal_value=fmt_mem(normal_mi),
+                    current_value=fmt_mem(current_mi)
+                        + (" ← OOMKilled" if is_oomkilled else ""),
+                    change_pct=change_pct,
+                    severity="CRITICAL" if is_oomkilled else "HIGH",
+                    first_detected=datetime.now().isoformat(),
+                    is_first_anomaly=(i == 0),
+                ))
+                continue
+
+            if metric == "error_rate":
+                normal_pct = 0.1
+                if restart_count >= 10:
+                    current_pct = 100.0
+                    severity = "CRITICAL"
+                elif restart_count >= 5:
+                    current_pct = 50.0
+                    severity = "HIGH"
+                else:
+                    current_pct = 5.0
+                    severity = "MEDIUM"
+
+                change_pct = round(
+                    (current_pct - normal_pct) / normal_pct * 100
+                    if normal_pct > 0 else 0,
+                    1,
+                )
+                anomalies.append(MetricAnomaly(
+                    metric="error_rate",
+                    normal_value=f"{normal_pct}%",
+                    current_value=f"{current_pct}%"
+                        + (f" ({restart_count} restarts)"
+                           if restart_count > 0 else ""),
+                    change_pct=change_pct,
+                    severity=severity,
+                    first_detected=datetime.now().isoformat(),
+                    is_first_anomaly=(i == 0),
+                ))
+                continue
+
+            # Other metrics (cpu, latency etc.) — fallback to baselines
             baseline = METRIC_BASELINES.get(metric, {})
             if not baseline:
                 continue
@@ -177,15 +272,12 @@ class AnomalyTimelineAnalyzer:
             normal = baseline["normal"]
             critical_threshold = baseline["critical_threshold"]
             unit = baseline["unit"]
-
-            # Simulate current value based on severity
             current = critical_threshold * 1.1
-
-            change_pct = (
+            change_pct = round(
                 (current - normal) / normal * 100
-                if normal > 0 else 0
+                if normal > 0 else 0,
+                1,
             )
-
             severity = self._classify_severity(
                 current,
                 baseline["warning_threshold"],
@@ -224,7 +316,6 @@ class AnomalyTimelineAnalyzer:
         self, anomalies: list[MetricAnomaly]
     ) -> str:
         """Find the first metric that failed."""
-        # Priority order — most likely root causes first
         priority = [
             "cpu", "memory", "connections",
             "traffic", "latency", "error_rate"
@@ -245,7 +336,6 @@ class AnomalyTimelineAnalyzer:
         self, alert_data: dict[str, Any]
     ) -> str:
         """Extract alert timestamp from alert data."""
-        # Try common alert time fields
         for field in [
             "timestamp", "time", "date",
             "alert_time", "created_at"
@@ -259,16 +349,31 @@ class AnomalyTimelineAnalyzer:
         self,
         alert_time: str,
         anomalies: list[MetricAnomaly],
+        alert_data: dict | None = None,
     ) -> str:
-        """Estimate when first anomaly occurred."""
-        # Anomalies typically happen 1-5 minutes before alert
+        """Estimate when first anomaly occurred.
+
+        Uses restart_count to infer a realistic lag:
+        each CrashLoop cycle is ~30s backoff minimum.
+        """
+        from datetime import timedelta
         try:
             alert_dt = datetime.fromisoformat(
                 alert_time.replace("Z", "+00:00")
             )
-            # Estimate 3 minutes before alert
-            from datetime import timedelta
-            first_anomaly = alert_dt - timedelta(minutes=3)
+            pod_details = alert_data.get("pod_details", {}) if alert_data else {}
+            service_info = alert_data.get("service_info", {}) if alert_data else {}
+            restart_count = int(
+                pod_details.get("restart_count")
+                or service_info.get("restart_count")
+                or (alert_data.get("restart_count", 0) if alert_data else 0)
+            )
+            # Each restart adds ~30s backoff; cap at 15 min
+            lag_seconds = min(restart_count * 30, 900)
+            lag_seconds = max(lag_seconds, 60)
+            first_anomaly = alert_dt - timedelta(
+                seconds=lag_seconds
+            )
             return first_anomaly.isoformat()
         except Exception:
             return alert_time
@@ -290,7 +395,7 @@ class AnomalyTimelineAnalyzer:
                 (alert - first).total_seconds()
             ))
         except Exception:
-            return 180  # Default 3 minutes
+            return 180
 
     def _build_summary(
         self,
@@ -347,9 +452,9 @@ def display_anomaly_timeline(
     print(f"\n  {BOLD}Metric Anomalies:{RESET}")
     print(
         f"  {'Metric':<15} {'Normal':<12} "
-        f"{'Current':<12} {'Change':<10} Severity"
+        f"{'Current':<30} {'Change':<10} Severity"
     )
-    print(f"  {'─' * 60}")
+    print(f"  {'─' * 75}")
 
     for anomaly in timeline.anomalies:
         color = (
@@ -361,7 +466,7 @@ def display_anomaly_timeline(
         print(
             f"  {anomaly.metric:<15} "
             f"{anomaly.normal_value:<12} "
-            f"{anomaly.current_value:<12} "
+            f"{anomaly.current_value:<30} "
             f"+{anomaly.change_pct:<9.1f}% "
             f"{color}{anomaly.severity}{RESET}"
             f"{BOLD}{marker}{RESET}"

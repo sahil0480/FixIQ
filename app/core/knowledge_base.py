@@ -1,7 +1,22 @@
 """Knowledge Base for FixIQ.
 
-Stores and retrieves past incidents and fixes.
-Learns from history to help engineers faster.
+Single source of truth for all incident history.
+Used by both the pipeline (auto-save) and the CLI
+(fixiq record) to store and retrieve incidents.
+
+Schema (one entry per unique root cause hash):
+{
+    "hash":               str,   # md5 of root_cause
+    "root_cause":         str,
+    "service":            str,
+    "date":               str,   # first seen
+    "last_seen":          str,
+    "occurrences":        int,
+    "fix_applied":        str,   # "Not yet applied" until recorded
+    "fix_date":           str | null,
+    "time_to_fix_minutes":int,
+    "outcome":            str    # "unknown" | "resolved" | "partial"
+}
 """
 
 from __future__ import annotations
@@ -28,7 +43,6 @@ class KnowledgeBase:
         self._ensure_storage()
 
     def _ensure_storage(self) -> None:
-        """Create storage if not exists."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             self.path.write_text(
@@ -36,47 +50,28 @@ class KnowledgeBase:
             )
 
     def _load(self) -> dict[str, Any]:
-        """Load knowledge base from disk."""
         try:
             return json.loads(self.path.read_text())
         except Exception as exc:
-            logger.warning(
-                "Failed to load knowledge base: %s", exc
-            )
+            logger.warning("Failed to load KB: %s", exc)
             return {"incidents": []}
 
     def _save(self, data: dict[str, Any]) -> None:
-        """Save knowledge base to disk."""
         try:
             self.path.write_text(
                 json.dumps(data, indent=2)
             )
         except Exception as exc:
-            logger.warning(
-                "Failed to save knowledge base: %s", exc
-            )
+            logger.warning("Failed to save KB: %s", exc)
 
     def _hash(self, root_cause: str) -> str:
-        """Create hash for root cause."""
-        return hashlib.md5(
-            root_cause.lower().strip().encode()
-        ).hexdigest()[:8]
-
-    def lookup(
-        self, root_cause: str
-    ) -> dict[str, Any] | None:
-        """Look up a past incident by root cause."""
-        data = self._load()
-        issue_hash = self._hash(root_cause)
-
-        for incident in data["incidents"]:
-            if incident.get("hash") == issue_hash:
-                logger.info(
-                    "Found past incident: %s",
-                    issue_hash
-                )
-                return incident
-        return None
+        import re
+        # Strip restart count so same issue with different
+        # restart counts maps to the same hash
+        normalised = re.sub(
+            r'\. Restart count: \d+', '', root_cause
+        ).lower().strip()
+        return hashlib.md5(normalised.encode()).hexdigest()[:8]
 
     def save(
         self,
@@ -84,78 +79,75 @@ class KnowledgeBase:
         rca_output: dict[str, Any],
         fix_applied: str | None = None,
     ) -> None:
-        """Save an incident to the knowledge base."""
+        """Auto-save incident when pipeline detects it.
+
+        If same root cause seen before, increments occurrences.
+        Does NOT overwrite a real fix with 'Not yet applied'.
+        """
         data = self._load()
         issue_hash = self._hash(root_cause)
+        service = (
+            rca_output.get("service")
+            or rca_output.get("k8s_info", {}).get("service", "unknown")
+        )
 
         for incident in data["incidents"]:
             if incident.get("hash") == issue_hash:
-                incident["last_seen"] = (
-                    datetime.now().isoformat()
-                )
+                incident["last_seen"] = datetime.now().isoformat()
                 incident["occurrences"] = (
                     incident.get("occurrences", 1) + 1
                 )
-                if fix_applied:
-                    incident["fix"] = fix_applied
-                    incident["fix_date"] = (
-                        datetime.now().isoformat()
-                    )
+                # Only update fix if a real one is being recorded
+                if fix_applied and fix_applied != "Not yet applied":
+                    incident["fix_applied"] = fix_applied
+                    incident["fix_date"] = datetime.now().isoformat()
+                    incident["outcome"] = "resolved"
                 self._save(data)
-                logger.info(
-                    "Updated incident: %s", issue_hash
-                )
                 return
 
         incident = {
             "hash": issue_hash,
             "root_cause": root_cause,
+            "service": service,
             "date": datetime.now().isoformat(),
             "last_seen": datetime.now().isoformat(),
             "occurrences": 1,
-            "fix": fix_applied or "Not yet applied",
+            "fix_applied": fix_applied or "Not yet applied",
             "fix_date": None,
+            "time_to_fix_minutes": 0,
             "outcome": "unknown",
-            "service": rca_output.get(
-                "service", "unknown"
-            ),
         }
 
         data["incidents"].append(incident)
         self._save(data)
-        logger.info(
-            "Saved new incident: %s", issue_hash
-        )
+        logger.info("Saved new incident: %s", issue_hash)
 
     def record_fix(
         self,
         service: str,
         fix_applied: str,
-    ) -> None:
-        """Record a fix applied to a service.
+        time_to_fix_minutes: int = 0,
+    ) -> bool:
+        """Record a confirmed fix for a service.
 
-        Updates the most recent incident for the service
-        with the fix that worked.
-
-        Args:
-            service: Service name that was fixed
-            fix_applied: Description of fix applied
+        Updates the most recent unresolved incident for the
+        service. Returns True if an incident was updated.
         """
         data = self._load()
         updated = False
 
         for incident in reversed(data["incidents"]):
             if incident.get("service") == service:
-                incident["fix"] = fix_applied
-                incident["fix_date"] = (
-                    datetime.now().isoformat()
-                )
+                incident["fix_applied"] = fix_applied
+                incident["fix_date"] = datetime.now().isoformat()
                 incident["outcome"] = "resolved"
+                if time_to_fix_minutes > 0:
+                    incident["time_to_fix_minutes"] = (
+                        time_to_fix_minutes
+                    )
                 updated = True
                 logger.info(
-                    "Recorded fix for %s: %s",
-                    service,
-                    fix_applied,
+                    "Recorded fix for %s: %s", service, fix_applied
                 )
                 break
 
@@ -165,21 +157,33 @@ class KnowledgeBase:
                     f"{service}_{fix_applied}"
                 ),
                 "root_cause": f"Incident in {service}",
+                "service": service,
                 "date": datetime.now().isoformat(),
                 "last_seen": datetime.now().isoformat(),
                 "occurrences": 1,
-                "fix": fix_applied,
+                "fix_applied": fix_applied,
                 "fix_date": datetime.now().isoformat(),
+                "time_to_fix_minutes": time_to_fix_minutes,
                 "outcome": "resolved",
-                "service": service,
             })
 
         self._save(data)
+        return updated
+
+    def lookup(
+        self, root_cause: str
+    ) -> dict[str, Any] | None:
+        """Look up a past incident by root cause hash."""
+        data = self._load()
+        issue_hash = self._hash(root_cause)
+        for incident in data["incidents"]:
+            if incident.get("hash") == issue_hash:
+                return incident
+        return None
 
     def list_all(self) -> list[dict[str, Any]]:
         """List all incidents in the knowledge base."""
-        data = self._load()
-        return data.get("incidents", [])
+        return self._load().get("incidents", [])
 
     def clear(self) -> None:
         """Clear the knowledge base."""

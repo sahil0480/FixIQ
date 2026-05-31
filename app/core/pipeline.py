@@ -107,9 +107,16 @@ class FixIQPipeline:
         self, incident: K8sIncident
     ) -> None:
         """Called when K8s incident is detected."""
-        if self.queue and self.queue.is_processing(
-            incident.service
-        ):
+        if not self.queue:
+            return
+
+        # Skip if already processing
+        if self.queue.is_processing(incident.service):
+            return
+
+        # Skip if already queued
+        if incident.service in \
+                self.queue._queued_services:
             return
 
         print(
@@ -140,14 +147,13 @@ class FixIQPipeline:
                     f"users=~{svc.users_affected}"
                 )
 
-        if self.queue:
-            self.queue.add(incident, alert)
-            queue_size = self.queue.size()
-            if queue_size > 1:
-                display_queue(
-                    self.queue,
-                    f"{queue_size} INCIDENTS QUEUED"
-                )
+        self.queue.add(incident, alert)
+        queue_size = self.queue.size()
+        if queue_size > 1:
+            display_queue(
+                self.queue,
+                f"{queue_size} INCIDENTS QUEUED"
+            )
 
     def _process_queue(self) -> None:
         """Worker thread — processes incidents in order."""
@@ -189,7 +195,6 @@ class FixIQPipeline:
                 f"{incident.service} already recovered "
                 f"— skipping investigation"
             )
-            # Mark as resolved so watcher ignores it
             self.watcher.mark_resolved(incident.service)
             return
 
@@ -579,11 +584,9 @@ class FixIQPipeline:
             rca_output, urgency, blast, service_info
         )
 
-        # Mark service as resolved so watcher
-        # doesn't re-investigate for 10 minutes
+        # Mark resolved — watcher ignores for 10 min
         self.watcher.mark_resolved(service_name)
 
-        # Save to knowledge base
         KnowledgeBase().save(
             rca_output.get("root_cause", ""),
             rca_output,

@@ -118,18 +118,7 @@ class CascadeAnalyzer:
         service_name: str,
         rca_output: dict[str, Any],
     ) -> CascadeAnalysis:
-        """Analyze cascade failure from a service.
-
-        Uses real K8s dependents if available,
-        falls back to hardcoded map otherwise.
-
-        Args:
-            service_name: Name of the root failing service
-            rca_output: RCA output from OpenSRE
-
-        Returns:
-            Complete cascade analysis
-        """
+        """Analyze cascade failure from a service."""
         root_cause = rca_output.get(
             "root_cause", ""
         ).lower()
@@ -141,12 +130,10 @@ class CascadeAnalyzer:
             failure_type, FAILURE_PATTERNS["config"]
         )
 
-        # Get REAL K8s dependents if available
         real_dependents = rca_output.get(
             "k8s_info", {}
         ).get("real_dependents", None)
 
-        # Build cascade levels
         levels = self._build_cascade_levels(
             service_name,
             pattern,
@@ -168,10 +155,16 @@ class CascadeAnalyzer:
             real_dependents is not None,
         )
 
+        # total_affected excludes the dummy placeholder
+        real_count = len([
+            l for l in levels
+            if l.service != "No dependent services"
+        ])
+
         return CascadeAnalysis(
             root_service=service_name,
             levels=levels,
-            total_affected=len(levels),
+            total_affected=real_count,
             fix_order=fix_order,
             summary=summary,
         )
@@ -213,11 +206,7 @@ class CascadeAnalyzer:
         root_cause: str,
         real_dependents: list[str] | None = None,
     ) -> list[CascadeLevel]:
-        """Build cascade levels from root service.
-
-        Uses real K8s dependents if available,
-        falls back to hardcoded SERVICE_GRAPH.
-        """
+        """Build cascade levels from root service."""
         levels = []
 
         # Level 0 — Root service (always)
@@ -230,10 +219,8 @@ class CascadeAnalyzer:
             recovery=pattern["recovery"],
         ))
 
-        # Use REAL K8s dependents if available
         if real_dependents is not None:
             if real_dependents:
-                # Real dependents found in cluster
                 for dep in real_dependents[:5]:
                     levels.append(CascadeLevel(
                         level=1,
@@ -249,7 +236,7 @@ class CascadeAnalyzer:
                         ),
                     ))
             else:
-                # Real K8s data available but no dependents
+                # No dependents — add placeholder for display
                 levels.append(CascadeLevel(
                     level=1,
                     service="No dependent services",
@@ -264,7 +251,6 @@ class CascadeAnalyzer:
                     ),
                 ))
         else:
-            # Fallback to hardcoded SERVICE_GRAPH
             direct_deps = SERVICE_GRAPH.get(
                 root_service, []
             )
@@ -285,7 +271,6 @@ class CascadeAnalyzer:
                         ),
                     ))
 
-                # Level 2 — Secondary dependents
                 for dep in direct_deps[:2]:
                     secondary = SERVICE_GRAPH.get(dep, [])
                     for sec in secondary[:2]:
@@ -345,12 +330,17 @@ class CascadeAnalyzer:
         real_data: bool = False,
     ) -> str:
         """Build human readable summary."""
-        affected = len(levels)
+        # Exclude dummy placeholder entry
+        real_levels = [
+            l for l in levels
+            if l.service != "No dependent services"
+        ]
+        affected = len(real_levels)
         critical = sum(
-            1 for l in levels if l.severity == "CRITICAL"
+            1 for l in real_levels if l.severity == "CRITICAL"
         )
         high = sum(
-            1 for l in levels if l.severity == "HIGH"
+            1 for l in real_levels if l.severity == "HIGH"
         )
 
         data_source = (

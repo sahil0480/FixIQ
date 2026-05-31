@@ -9,15 +9,17 @@ Priority is based on:
 - Severity level
 - Users affected
 - Cascade potential
+
+Deduplication:
+- Same service won't be queued twice
+- Already processing services are skipped
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-import time
 from dataclasses import dataclass
-from dataclasses import field
 from datetime import datetime
 from queue import PriorityQueue
 from typing import Any
@@ -27,7 +29,6 @@ from app.core.service_discovery import SystemMap
 
 logger = logging.getLogger(__name__)
 
-# ANSI colors
 BOLD = "\033[1m"
 RED = "\033[91m"
 YELLOW = "\033[93m"
@@ -47,7 +48,9 @@ class QueuedIncident:
     service_criticality: int
     estimated_users: int
 
-    def __lt__(self, other: "QueuedIncident") -> bool:
+    def __lt__(
+        self, other: "QueuedIncident"
+    ) -> bool:
         """Compare for priority queue ordering."""
         return self.priority > other.priority
 
@@ -61,6 +64,7 @@ class IncidentQueue:
     ) -> None:
         self.system_map = system_map
         self._queue: PriorityQueue = PriorityQueue()
+        self._queued_services: set[str] = set()
         self._processing: set[str] = set()
         self._processed: list[QueuedIncident] = []
         self._lock = threading.Lock()
@@ -72,49 +76,76 @@ class IncidentQueue:
     ) -> None:
         """Add incident to priority queue.
 
+        Deduplicates — same service won't be
+        added twice if already queued or processing.
+
         Args:
             incident: Detected K8s incident
             alert: Built alert data
         """
-        # Calculate priority score
-        priority = self._calculate_priority(
-            incident, alert
-        )
+        with self._lock:
+            # Deduplicate — skip if already queued
+            if incident.service in self._queued_services:
+                logger.info(
+                    "Skipping duplicate: %s already queued",
+                    incident.service,
+                )
+                return
 
-        # Get service info from system map
-        criticality = 5
-        users = 100
-        if self.system_map:
-            svc = self.system_map.get_service(
-                incident.service
+            # Skip if already processing
+            if incident.service in self._processing:
+                logger.info(
+                    "Skipping: %s already processing",
+                    incident.service,
+                )
+                return
+
+            # Calculate priority score
+            priority = self._calculate_priority(
+                incident, alert
             )
-            if svc:
-                criticality = svc.criticality
-                users = svc.users_affected
 
-        queued = QueuedIncident(
-            priority=priority,
-            incident=incident,
-            alert=alert,
-            queued_at=datetime.now().isoformat(),
-            service_criticality=criticality,
-            estimated_users=users,
-        )
+            # Get service info from system map
+            criticality = 5
+            users = 100
+            if self.system_map:
+                svc = self.system_map.get_service(
+                    incident.service
+                )
+                if svc:
+                    criticality = svc.criticality
+                    users = svc.users_affected
 
-        self._queue.put(queued)
+            queued = QueuedIncident(
+                priority=priority,
+                incident=incident,
+                alert=alert,
+                queued_at=datetime.now().isoformat(),
+                service_criticality=criticality,
+                estimated_users=users,
+            )
 
-        logger.info(
-            "Queued incident: %s (priority=%.1f)",
-            incident.service,
-            priority,
-        )
+            self._queue.put(queued)
+            self._queued_services.add(incident.service)
+
+            logger.info(
+                "Queued incident: %s (priority=%.1f)",
+                incident.service,
+                priority,
+            )
 
     def get_next(self) -> QueuedIncident | None:
         """Get highest priority incident."""
         try:
             if self._queue.empty():
                 return None
-            return self._queue.get_nowait()
+            item = self._queue.get_nowait()
+            # Remove from queued set
+            with self._lock:
+                self._queued_services.discard(
+                    item.incident.service
+                )
+            return item
         except Exception:
             return None
 
@@ -139,10 +170,11 @@ class IncidentQueue:
             except Exception:
                 break
 
-        # Restore queue
         while not temp_queue.empty():
             try:
-                self._queue.put(temp_queue.get_nowait())
+                self._queue.put(
+                    temp_queue.get_nowait()
+                )
             except Exception:
                 break
 
@@ -160,7 +192,6 @@ class IncidentQueue:
         """Calculate priority score for incident."""
         score = 0.0
 
-        # Severity score
         severity_scores = {
             "critical": 10,
             "high": 7,
@@ -171,15 +202,15 @@ class IncidentQueue:
             incident.severity, 5
         ) * 0.30
 
-        # Service criticality from system map
         criticality = 5
         if self.system_map:
-            criticality = self.system_map.get_criticality(
-                incident.service
+            criticality = (
+                self.system_map.get_criticality(
+                    incident.service
+                )
             )
         score += criticality * 0.35
 
-        # Restart count — more restarts = more urgent
         restart_count = alert.get(
             "metrics", {}
         ).get("restart_count", 0)
@@ -192,7 +223,6 @@ class IncidentQueue:
 
         score *= 0.25
 
-        # Error rate
         error_rate = alert.get(
             "metrics", {}
         ).get("error_rate_pct", 0)
@@ -209,23 +239,28 @@ class IncidentQueue:
         self, service: str
     ) -> None:
         """Mark service as being processed."""
-        self._processing.add(service)
+        with self._lock:
+            self._processing.add(service)
+            self._queued_services.discard(service)
 
     def mark_done(
         self,
         queued: QueuedIncident
     ) -> None:
         """Mark incident as processed."""
-        self._processing.discard(
-            queued.incident.service
-        )
+        with self._lock:
+            self._processing.discard(
+                queued.incident.service
+            )
         self._processed.append(queued)
 
     def is_processing(self, service: str) -> bool:
         """Check if service is being processed."""
         return service in self._processing
 
-    def get_processed(self) -> list[QueuedIncident]:
+    def get_processed(
+        self,
+    ) -> list[QueuedIncident]:
         """Get all processed incidents."""
         return self._processed.copy()
 
@@ -280,8 +315,9 @@ def display_queue(
             f"{status}"
         )
         print(
-            f"  {DIM}     Reason: {item.incident.reason} "
-            f"— {item.incident.message[:50]}{RESET}"
+            f"  {DIM}     Reason: "
+            f"{item.incident.reason} — "
+            f"{item.incident.message[:50]}{RESET}"
         )
 
     print(f"\n{BOLD}{'═' * 70}{RESET}")

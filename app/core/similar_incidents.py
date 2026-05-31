@@ -9,20 +9,13 @@ Reduces MTTR dramatically by showing what worked before.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from app.core.knowledge_base import KnowledgeBase
 
-# Storage location
-INCIDENTS_PATH = (
-    Path.home() / ".config" / "fixiq" / "knowledge_base.json"
-)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -35,7 +28,7 @@ class SimilarIncident:
     fix_applied: str
     time_to_fix_minutes: int
     similarity_score: float
-    outcome: str    # resolved, unresolved, partial
+    outcome: str
 
 
 @dataclass
@@ -52,37 +45,8 @@ class SimilarIncidentsResult:
 class SimilarIncidentsFinder:
     """Finds and stores similar incidents."""
 
-    def __init__(
-        self, path: Path = INCIDENTS_PATH
-    ) -> None:
-        self.path = path
-        self._ensure_storage()
-
-    def _ensure_storage(self) -> None:
-        """Create storage if not exists."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            self.path.write_text(
-                json.dumps({"incidents": []}, indent=2)
-            )
-
-    def _load(self) -> dict[str, Any]:
-        """Load incidents from disk."""
-        try:
-            return json.loads(self.path.read_text())
-        except Exception:
-            return {"incidents": []}
-
-    def _save(self, data: dict[str, Any]) -> None:
-        """Save incidents to disk."""
-        try:
-            self.path.write_text(
-                json.dumps(data, indent=2)
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to save incidents: %s", exc
-            )
+    def __init__(self) -> None:
+        self.kb = KnowledgeBase()
 
     def find(
         self,
@@ -90,64 +54,48 @@ class SimilarIncidentsFinder:
         service_name: str,
         rca_output: dict[str, Any],
     ) -> SimilarIncidentsResult:
-        """Find similar past incidents.
-
-        Args:
-            root_cause: Current root cause
-            service_name: Affected service
-            rca_output: RCA output from OpenSRE
-
-        Returns:
-            Similar incidents result
-        """
-        data = self._load()
-        all_incidents = data.get("incidents", [])
+        """Find similar past incidents."""
+        all_incidents = self.kb.list_all()
 
         if not all_incidents:
             return SimilarIncidentsResult(
                 found=False,
                 incidents=[],
                 best_match=None,
-                recommended_fix="No history yet. "
-                    "This will be saved for future reference.",
+                recommended_fix=(
+                    "No history yet. "
+                    "This will be saved for future reference."
+                ),
                 success_rate=0.0,
                 avg_time_to_fix=0,
             )
 
-        # Score each incident
         similar = []
         for incident in all_incidents:
             score = self._calculate_similarity(
-                root_cause,
-                service_name,
-                incident,
+                root_cause, service_name, incident
             )
             if score >= 0.3:
                 similar.append(SimilarIncident(
-                    id=incident.get("id", "unknown"),
+                    id=incident.get(
+                        "hash", incident.get("id", "unknown")
+                    ),
                     date=incident.get("date", "unknown"),
-                    root_cause=incident.get(
-                        "root_cause", ""
-                    ),
-                    service=incident.get(
-                        "service", "unknown"
-                    ),
+                    root_cause=incident.get("root_cause", ""),
+                    service=incident.get("service", "unknown"),
                     fix_applied=incident.get(
-                        "fix_applied", "Unknown"
+                        "fix_applied",
+                        incident.get("fix", "Not yet applied")
                     ),
                     time_to_fix_minutes=incident.get(
                         "time_to_fix_minutes", 0
                     ),
                     similarity_score=score,
-                    outcome=incident.get(
-                        "outcome", "unknown"
-                    ),
+                    outcome=incident.get("outcome", "unknown"),
                 ))
 
-        # Sort by similarity
         similar.sort(
-            key=lambda x: x.similarity_score,
-            reverse=True
+            key=lambda x: x.similarity_score, reverse=True
         )
         similar = similar[:5]
 
@@ -167,9 +115,7 @@ class SimilarIncidentsFinder:
         best = similar[0]
         success_rate = self._calculate_success_rate(similar)
         avg_time = self._calculate_avg_time(similar)
-        recommended_fix = self._build_recommendation(
-            best, similar
-        )
+        recommended_fix = self._build_recommendation(similar)
 
         logger.info(
             "Found %d similar incidents, "
@@ -195,38 +141,11 @@ class SimilarIncidentsFinder:
         time_to_fix_minutes: int,
         outcome: str = "resolved",
     ) -> None:
-        """Save a new incident to history.
-
-        Args:
-            root_cause: Root cause of incident
-            service_name: Affected service
-            fix_applied: What fix was applied
-            time_to_fix_minutes: How long it took
-            outcome: resolved/unresolved/partial
-        """
-        data = self._load()
-
-        incident_id = hashlib.md5(
-            f"{root_cause}{service_name}"
-            f"{datetime.now().isoformat()}".encode()
-        ).hexdigest()[:8]
-
-        incident = {
-            "id": incident_id,
-            "date": datetime.now().isoformat(),
-            "root_cause": root_cause,
-            "service": service_name,
-            "fix_applied": fix_applied,
-            "time_to_fix_minutes": time_to_fix_minutes,
-            "outcome": outcome,
-        }
-
-        data["incidents"].append(incident)
-        self._save(data)
-
-        logger.info(
-            "Saved incident %s to history",
-            incident_id
+        """Save a resolved incident via fixiq record."""
+        self.kb.record_fix(
+            service=service_name,
+            fix_applied=fix_applied,
+            time_to_fix_minutes=time_to_fix_minutes,
         )
 
     def _calculate_similarity(
@@ -238,16 +157,13 @@ class SimilarIncidentsFinder:
         """Calculate similarity between two incidents."""
         score = 0.0
 
-        # Same service = high similarity
         if incident.get("service") == service_name:
             score += 0.3
 
-        # Similar root cause
         current_words = set(root_cause.lower().split())
         past_words = set(
             incident.get("root_cause", "").lower().split()
         )
-
         if current_words and past_words:
             overlap = current_words & past_words
             similarity = len(overlap) / max(
@@ -255,7 +171,6 @@ class SimilarIncidentsFinder:
             )
             score += similarity * 0.5
 
-        # Resolved incidents are more valuable
         if incident.get("outcome") == "resolved":
             score += 0.2
 
@@ -264,25 +179,21 @@ class SimilarIncidentsFinder:
     def _calculate_success_rate(
         self, incidents: list[SimilarIncident]
     ) -> float:
-        """Calculate success rate of past fixes."""
         if not incidents:
             return 0.0
         resolved = sum(
-            1 for i in incidents
-            if i.outcome == "resolved"
+            1 for i in incidents if i.outcome == "resolved"
         )
         return round(resolved / len(incidents), 2)
 
     def _calculate_avg_time(
         self, incidents: list[SimilarIncident]
     ) -> int:
-        """Calculate average time to fix."""
-        if not incidents:
-            return 0
         times = [
             i.time_to_fix_minutes
             for i in incidents
             if i.time_to_fix_minutes > 0
+            and i.outcome == "resolved"
         ]
         if not times:
             return 0
@@ -290,19 +201,42 @@ class SimilarIncidentsFinder:
 
     def _build_recommendation(
         self,
-        best: SimilarIncident,
         all_similar: list[SimilarIncident],
     ) -> str:
-        """Build fix recommendation from history."""
-        score_pct = int(best.similarity_score * 100)
-        success = self._calculate_success_rate(all_similar)
-        avg_time = self._calculate_avg_time(all_similar)
+        """Build fix recommendation.
 
+        Prioritises resolved entries with a real fix.
+        Falls back to best similarity match if none resolved.
+        """
+        resolved = [
+            i for i in all_similar
+            if i.outcome == "resolved"
+            and i.fix_applied not in (
+                "Not yet applied", "", "Unknown"
+            )
+        ]
+
+        if resolved:
+            best = resolved[0]
+            score_pct = int(best.similarity_score * 100)
+            avg_time = self._calculate_avg_time(all_similar)
+            time_str = (
+                f" Avg fix time: {avg_time} minutes."
+                if avg_time > 0 else ""
+            )
+            return (
+                f"✅ Known fix ({score_pct}% match): "
+                f"{best.fix_applied}.{time_str}"
+            )
+
+        best = all_similar[0]
+        score_pct = int(best.similarity_score * 100)
         return (
             f"Best match ({score_pct}% similar): "
-            f"{best.fix_applied}. "
-            f"Success rate: {int(success * 100)}%. "
-            f"Avg fix time: {avg_time} minutes."
+            f"Not yet applied. "
+            f"No confirmed fix recorded yet — "
+            f"run 'fixiq record -s {best.service} "
+            f"-f <fix>' after resolving."
         )
 
 
@@ -314,7 +248,6 @@ def display_similar_incidents(
     RED = "\033[91m"
     YELLOW = "\033[93m"
     GREEN = "\033[92m"
-    DIM = "\033[2m"
     RESET = "\033[0m"
 
     print(f"\n{BOLD}{'─' * 70}{RESET}")
@@ -327,25 +260,28 @@ def display_similar_incidents(
         print(f"\n{BOLD}{'─' * 70}{RESET}")
         return
 
+    resolved_count = sum(
+        1 for i in result.incidents if i.outcome == "resolved"
+    )
+
     print(
         f"\n  Found {GREEN}{len(result.incidents)}"
-        f"{RESET} similar incidents"
+        f"{RESET} similar incidents "
+        f"({GREEN}{resolved_count} resolved{RESET})"
     )
     print(
         f"  Success rate: "
         f"{GREEN}{int(result.success_rate * 100)}%{RESET}"
     )
-    print(
-        f"  Avg fix time: "
-        f"{result.avg_time_to_fix} minutes"
-    )
+    if result.avg_time_to_fix > 0:
+        print(
+            f"  Avg fix time: {result.avg_time_to_fix} minutes"
+        )
 
     print(f"\n  {BOLD}Past Incidents:{RESET}")
-    for i, incident in enumerate(
-        result.incidents[:3], 1
-    ):
+    for i, incident in enumerate(result.incidents[:3], 1):
         score_pct = int(incident.similarity_score * 100)
-        color = (
+        score_color = (
             GREEN if score_pct >= 70 else
             YELLOW if score_pct >= 40 else
             RED
@@ -354,21 +290,21 @@ def display_similar_incidents(
             GREEN if incident.outcome == "resolved"
             else YELLOW
         )
+        fix_display = (
+            f"{YELLOW}Not yet applied{RESET}"
+            if incident.fix_applied == "Not yet applied"
+            else incident.fix_applied
+        )
 
-        print(f"\n  {BOLD}#{i}{RESET} — "
-              f"{incident.date[:10]}")
-        print(
-            f"  Similarity: {color}{score_pct}%{RESET}"
-        )
-        print(
-            f"  Service:    {incident.service}"
-        )
-        print(
-            f"  Fix:        {incident.fix_applied[:60]}"
-        )
-        print(
-            f"  Time:       {incident.time_to_fix_minutes} min"
-        )
+        print(f"\n  {BOLD}#{i}{RESET} — {incident.date[:10]}")
+        print(f"  Similarity: {score_color}{score_pct}%{RESET}")
+        print(f"  Service:    {incident.service}")
+        print(f"  Fix:        {fix_display}")
+        if incident.time_to_fix_minutes > 0:
+            print(
+                f"  Time:       "
+                f"{incident.time_to_fix_minutes} min"
+            )
         print(
             f"  Outcome:    "
             f"{outcome_color}{incident.outcome}{RESET}"

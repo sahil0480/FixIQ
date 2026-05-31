@@ -49,56 +49,40 @@ class EvidenceChainAnalyzer:
         rca_output: dict[str, Any],
         alert_data: dict[str, Any],
     ) -> EvidenceChain:
-        """Build complete evidence chain.
-
-        Args:
-            rca_output: RCA output from OpenSRE
-            alert_data: Original alert data
-
-        Returns:
-            Complete evidence chain
-        """
+        """Build complete evidence chain."""
         evidence_items = []
 
-        # Extract from OpenSRE evidence entries
         raw_entries = rca_output.get("evidence_entries", [])
         for entry in raw_entries:
             item = self._parse_evidence_entry(entry)
             if item:
                 evidence_items.append(item)
 
-        # Extract from logs in RCA output
         log_evidence = self._extract_log_evidence(rca_output)
         evidence_items.extend(log_evidence)
 
-        # Extract directly from raw alert logs
         alert_log_evidence = self._extract_alert_logs(alert_data)
         evidence_items.extend(alert_log_evidence)
 
-        # Extract metrics from alert data
         metric_evidence = self._extract_metric_evidence(alert_data)
         evidence_items.extend(metric_evidence)
 
-        # Extract file + line numbers
         affected_files = self._extract_file_locations(
             rca_output, evidence_items
         )
 
-        # Sort by timestamp
         evidence_items.sort(key=lambda x: x.timestamp)
 
-        # Build root trigger
         root_trigger = self._identify_root_trigger(
             evidence_items, rca_output
         )
 
-        # Build summary
         summary = self._build_summary(
             root_trigger, evidence_items, affected_files
         )
 
         confidence = self._calculate_confidence(
-            evidence_items, affected_files
+            evidence_items, affected_files, alert_data
         )
 
         logger.info(
@@ -128,7 +112,6 @@ class EvidenceChainAnalyzer:
             )
             source = entry.get("type", "log")
 
-            # Detect severity
             severity = "INFO"
             if any(k in content.lower() for k in [
                 "error", "exception", "failed", "failure"
@@ -143,7 +126,6 @@ class EvidenceChainAnalyzer:
             ]):
                 severity = "CRITICAL"
 
-            # Extract file and line
             file_match = re.search(
                 r'([a-zA-Z_/]+\.py)[:\s]+(\d+)', content
             )
@@ -175,7 +157,6 @@ class EvidenceChainAnalyzer:
         root_cause = rca_output.get("root_cause", "")
         report = rca_output.get("report", "")
 
-        # Look for error patterns in report
         error_patterns = [
             r'(\w+Error|\w+Exception).*?(?:at|in)\s+'
             r'(\S+\.py)[:\s]+(\d+)',
@@ -201,7 +182,6 @@ class EvidenceChainAnalyzer:
                 )
                 items.append(item)
 
-        # Add root cause as evidence
         if root_cause and root_cause != "Unknown":
             items.append(EvidenceItem(
                 timestamp=datetime.now().isoformat(),
@@ -220,7 +200,6 @@ class EvidenceChainAnalyzer:
         logs = alert_data.get("logs", [])
 
         for log in logs:
-            # Detect severity from log prefix
             severity = "INFO"
             if log.startswith("CRITICAL"):
                 severity = "CRITICAL"
@@ -229,7 +208,6 @@ class EvidenceChainAnalyzer:
             elif log.startswith("WARNING"):
                 severity = "WARNING"
 
-            # Extract file and line number
             file_match = re.search(
                 r'([a-zA-Z_/]+\.py):(\d+)', log
             )
@@ -260,7 +238,6 @@ class EvidenceChainAnalyzer:
         if not metrics:
             return items
 
-        # Check for critical metric values
         metric_checks = {
             "memory_usage_mb": (
                 512, "Memory usage: {val}MB"
@@ -324,7 +301,6 @@ class EvidenceChainAnalyzer:
                         item.message
                     )
 
-        # Sort by severity
         severity_order = {
             "CRITICAL": 0,
             "ERROR": 1,
@@ -348,7 +324,6 @@ class EvidenceChainAnalyzer:
         if root_cause and root_cause != "Unknown":
             return root_cause
 
-        # Find earliest critical/error item
         for item in items:
             if item.severity in ["CRITICAL", "ERROR"]:
                 return item.message
@@ -381,31 +356,76 @@ class EvidenceChainAnalyzer:
         self,
         items: list[EvidenceItem],
         affected_files: list[dict[str, Any]],
+        alert_data: dict[str, Any] | None = None,
     ) -> float:
-        """Calculate confidence in the evidence chain."""
+        """Calculate confidence in the evidence chain.
+
+        Scores based on K8s data quality since we rarely
+        have file/line numbers for container incidents.
+        """
         score = 0.0
 
-        # More evidence = higher confidence
-        if len(items) >= 10:
-            score += 0.3
-        elif len(items) >= 5:
-            score += 0.2
+        # Base: evidence items collected
+        if len(items) >= 5:
+            score += 0.15
+        elif len(items) >= 2:
+            score += 0.10
         elif len(items) >= 1:
-            score += 0.1
+            score += 0.05
 
-        # File locations found = higher confidence
-        if len(affected_files) >= 3:
-            score += 0.3
-        elif len(affected_files) >= 1:
-            score += 0.2
+        # Clear critical root cause (not "Unknown")
+        rca_items = [
+            i for i in items
+            if i.source == "rca" and i.severity == "CRITICAL"
+        ]
+        if rca_items:
+            score += 0.20
 
-        # Has critical evidence
-        if any(i.severity == "CRITICAL" for i in items):
-            score += 0.2
+        # Real K8s data — check pod_details and service_info
+        pod_details = {}
+        service_info = {}
+        if alert_data:
+            pod_details = alert_data.get("pod_details", {})
+            service_info = alert_data.get("service_info", {})
 
-        # Has file + line numbers
-        if any(i.file and i.line for i in items):
-            score += 0.2
+        has_exit_code = bool(pod_details.get("exit_code"))
+        has_memory_limit = bool(
+            pod_details.get("memory_limit")
+            or service_info.get("memory_limit")
+        )
+        has_restart_count = bool(
+            pod_details.get("restart_count")
+            or service_info.get("restart_count")
+        )
+
+        # Exit code — we know HOW it died
+        if has_exit_code:
+            score += 0.15
+
+        # Memory limit — we know the resource config
+        if has_memory_limit:
+            score += 0.15
+
+        # Restart count — how long it has been failing
+        if has_restart_count:
+            restart_count = int(
+                pod_details.get("restart_count")
+                or service_info.get("restart_count", 0)
+            )
+            if restart_count >= 10:
+                score += 0.15
+            elif restart_count >= 3:
+                score += 0.10
+            else:
+                score += 0.05
+
+        # OOMKilled confirmed (exit 137) — definitive cause
+        if pod_details.get("exit_code") == 137:
+            score += 0.20
+
+        # File locations found (rare but valuable)
+        if len(affected_files) >= 1:
+            score += 0.10
 
         return round(min(1.0, score), 2)
 

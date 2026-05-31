@@ -121,6 +121,51 @@ class ServiceDiscovery:
         self.namespace = namespace
         self._system_map: SystemMap | None = None
 
+    def _get_all_pods(self) -> dict[str, dict]:
+        """Bulk-fetch ALL pods once and index by app label.
+
+        One kubectl call instead of N calls (one per service).
+        Much faster under cluster stress.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "kubectl", "get", "pods",
+                    "-n", self.namespace,
+                    "-o", "json",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if result.returncode != 0:
+                return {}
+            data = json.loads(result.stdout)
+            index: dict[str, dict] = {}
+            for pod in data.get("items", []):
+                app_label = (
+                    pod.get("metadata", {})
+                    .get("labels", {})
+                    .get("app", "")
+                )
+                if app_label and app_label not in index:
+                    status = pod.get("status", {})
+                    cs = status.get("containerStatuses", [{}])
+                    container_status = cs[0] if cs else {}
+                    index[app_label] = {
+                        "phase": status.get("phase", "Unknown"),
+                        "restart_count": container_status.get(
+                            "restartCount", 0
+                        ),
+                        "ready": container_status.get(
+                            "ready", False
+                        ),
+                    }
+            return index
+        except Exception as exc:
+            logger.warning("Failed to bulk-fetch pods: %s", exc)
+            return {}
+
     def discover(self) -> SystemMap:
         """Discover all services in cluster."""
         print(
@@ -131,9 +176,17 @@ class ServiceDiscovery:
         services = {}
         deployments = self._get_deployments()
 
+        # ONE bulk pod fetch instead of N individual calls
+        all_pods = self._get_all_pods()
+        if not all_pods and deployments:
+            logger.warning(
+                "Pod bulk-fetch returned nothing — "
+                "pod status will show as Unknown"
+            )
+
         for deployment in deployments:
             config = self._build_service_config(
-                deployment
+                deployment, pod_cache=all_pods
             )
             if config:
                 services[config.name] = config
@@ -200,7 +253,9 @@ class ServiceDiscovery:
             return []
 
     def _build_service_config(
-        self, deployment: dict
+        self,
+        deployment: dict,
+        pod_cache: dict[str, dict] | None = None,
     ) -> ServiceConfig | None:
         """Build service config from deployment."""
         try:
@@ -236,7 +291,12 @@ class ServiceDiscovery:
                     env_vars.append(env_name)
                     env_values[env_name] = env_val
 
-            pod_info = self._get_pod_info(name)
+            # Use pod cache (bulk fetch) — no per-service kubectl call
+            if pod_cache is not None:
+                pod_info = pod_cache.get(name, {})
+            else:
+                pod_info = self._get_pod_info(name)
+
             criticality = self._calculate_criticality(
                 name
             )
@@ -300,7 +360,7 @@ class ServiceDiscovery:
     def _get_pod_info(
         self, service_name: str
     ) -> dict[str, Any]:
-        """Get pod status for a service."""
+        """Get pod status for a service (fallback, single service)."""
         try:
             result = subprocess.run(
                 [
