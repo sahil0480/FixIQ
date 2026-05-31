@@ -495,7 +495,6 @@ class FixIQPipeline:
         deps = service_info.get("depends_on", [])
         image = pod_details.get("image", "unknown")
 
-        # Detect failure type from title + logs
         title_lower = title.lower()
         logs_text = " ".join(logs).lower()
         all_text = title_lower + " " + logs_text
@@ -845,6 +844,9 @@ class FixIQPipeline:
                     time_to_fix_minutes=0,
                 )
                 kb.mark_snapshot_resolved(service)
+                # Mark as resolved in watcher so stale
+                # events don't trigger false investigations
+                self.watcher.mark_resolved(service)
                 recovered.append((service, fix_description))
 
         if recovered:
