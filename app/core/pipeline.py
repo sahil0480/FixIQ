@@ -78,6 +78,9 @@ class FixIQPipeline:
         self._system_map = self.discovery.discover()
         display_system_map(self._system_map)
 
+        # Check for recovered services before watching
+        self._check_recoveries()
+
         self.queue = IncidentQueue(
             system_map=self._system_map
         )
@@ -107,16 +110,9 @@ class FixIQPipeline:
         self, incident: K8sIncident
     ) -> None:
         """Called when K8s incident is detected."""
-        if not self.queue:
-            return
-
-        # Skip if already processing
-        if self.queue.is_processing(incident.service):
-            return
-
-        # Skip if already queued
-        if incident.service in \
-                self.queue._queued_services:
+        if self.queue and self.queue.is_processing(
+            incident.service
+        ):
             return
 
         print(
@@ -147,13 +143,14 @@ class FixIQPipeline:
                     f"users=~{svc.users_affected}"
                 )
 
-        self.queue.add(incident, alert)
-        queue_size = self.queue.size()
-        if queue_size > 1:
-            display_queue(
-                self.queue,
-                f"{queue_size} INCIDENTS QUEUED"
-            )
+        if self.queue:
+            self.queue.add(incident, alert)
+            queue_size = self.queue.size()
+            if queue_size > 1:
+                display_queue(
+                    self.queue,
+                    f"{queue_size} INCIDENTS QUEUED"
+                )
 
     def _process_queue(self) -> None:
         """Worker thread — processes incidents in order."""
@@ -176,7 +173,6 @@ class FixIQPipeline:
         incident = queued.incident
         alert = queued.alert
 
-        # Check if service already recovered
         from app.core.k8s_collector import K8sCollector
         collector = K8sCollector(
             namespace=self.namespace
@@ -305,10 +301,21 @@ class FixIQPipeline:
             alert, rca_output, incident.service
         )
 
+    # Set to True to enable Ollama LLM investigation.
+    # Set to False on low RAM machines (< 16GB).
+    OLLAMA_ENABLED = True
+
     def _run_opensre(
         self, alert: dict[str, Any]
     ) -> dict[str, Any]:
         """Run OpenSRE investigation with live progress."""
+        if not self.OLLAMA_ENABLED:
+            print(
+                f"  {DIM}→ Ollama disabled "
+                f"(low RAM mode) — using fallback RCA{RESET}"
+            )
+            return self._fallback_rca(alert)
+
         try:
             with tempfile.NamedTemporaryFile(
                 mode="w",
@@ -464,21 +471,46 @@ class FixIQPipeline:
     def _fallback_rca(
         self, alert: dict[str, Any]
     ) -> dict[str, Any]:
-        """Fallback RCA built from real K8s data."""
+        """Fallback RCA built from real K8s data.
+
+        Handles distinct failure types:
+        - OOMKilled (exit 137)  — memory limit exceeded
+        - Image pull failure    — bad image name/registry
+        - Command/config crash  — bad startup command
+        - CrashLoop             — repeated app crash
+        """
         title = alert.get("title", "Unknown")
         pod_details = alert.get("pod_details", {})
         service_info = alert.get("service_info", {})
+        logs = alert.get("logs", [])
 
         root_cause = title
         actions = []
+        failure_type = "unknown"
 
         exit_code = pod_details.get("exit_code", 0)
         mem = pod_details.get("memory_limit", "unknown")
         restarts = pod_details.get("restart_count", 0)
         service = alert.get("service", "unknown")
         deps = service_info.get("depends_on", [])
+        image = pod_details.get("image", "unknown")
+
+        # Detect failure type from title + logs
+        title_lower = title.lower()
+        logs_text = " ".join(logs).lower()
+        all_text = title_lower + " " + logs_text
+
+        image_pull_errors = [
+            "errimagepull", "imagepullbackoff",
+            "errimageneverpull", "back-off pulling image",
+            "failed to pull image", "not found",
+        ]
+        is_image_failure = any(
+            e in all_text for e in image_pull_errors
+        )
 
         if exit_code == 137:
+            failure_type = "oomkilled"
             root_cause = (
                 f"Pod OOMKilled in {service} — "
                 f"memory limit {mem} exceeded. "
@@ -491,19 +523,56 @@ class FixIQPipeline:
             ]
             if deps:
                 actions.append(
-                    f"Check downstream: "
-                    f"{', '.join(deps)}"
+                    f"Check downstream: {', '.join(deps)}"
                 )
-        elif "BackOff" in title or "CrashLoop" in title:
+
+        elif is_image_failure:
+            failure_type = "image_pull"
             root_cause = (
-                f"Container crash loop in {service} — "
-                f"check application logs and config"
+                f"Image pull failed in {service} — "
+                f"image '{image}' cannot be pulled. "
+                f"Check image name and registry access."
             )
             actions = [
-                "Check container logs for errors",
-                "Verify configuration and env vars",
-                f"Check memory limit: {mem}",
+                f"Verify image name is correct: {image}",
+                f"Run: kubectl set image deployment/{service} "
+                f"{service}=<correct-image>",
+                "Check image registry is accessible",
+                "Check imagePullPolicy in deployment spec",
             ]
+
+        elif exit_code == 1 or (
+            "backoff" in title_lower or
+            "crashloop" in title_lower or
+            "error" in title_lower
+        ):
+            failure_type = "crash"
+            if restarts <= 5:
+                root_cause = (
+                    f"Container crash in {service} — "
+                    f"exited with code {exit_code}. "
+                    f"Likely bad startup command or config."
+                )
+                actions = [
+                    f"Check recent changes: "
+                    f"kubectl rollout history "
+                    f"deployment/{service}",
+                    f"Rollback if recently patched: "
+                    f"kubectl rollout undo "
+                    f"deployment/{service}",
+                    "Check container logs for startup error",
+                    "Verify env vars and startup command",
+                ]
+            else:
+                root_cause = (
+                    f"Container crash loop in {service} — "
+                    f"check application logs and config"
+                )
+                actions = [
+                    "Check container logs for errors",
+                    "Verify configuration and env vars",
+                    f"Check memory limit: {mem}",
+                ]
 
         return {
             "root_cause": root_cause,
@@ -511,6 +580,7 @@ class FixIQPipeline:
             "evidence_entries": [],
             "report": root_cause,
             "service": service,
+            "failure_type": failure_type,
         }
 
     def _run_fixiq_analysis(
@@ -584,13 +654,40 @@ class FixIQPipeline:
             rca_output, urgency, blast, service_info
         )
 
-        # Mark resolved — watcher ignores for 10 min
         self.watcher.mark_resolved(service_name)
 
-        KnowledgeBase().save(
+        # Save snapshot of broken state for recovery detection
+        kb = KnowledgeBase()
+        pod_details = alert.get("pod_details", {})
+        service_info = alert.get("service_info", {})
+        kb.save_snapshot(service_name, {
+            "memory_limit": (
+                pod_details.get("memory_limit")
+                or service_info.get("memory_limit", "")
+            ),
+            "memory_request": service_info.get(
+                "memory_request", ""
+            ),
+            "cpu_limit": service_info.get("cpu_limit", ""),
+            "image": service_info.get("image", ""),
+            "restart_count": (
+                pod_details.get("restart_count")
+                or service_info.get("restart_count", 0)
+            ),
+            "exit_code": pod_details.get("exit_code", 0),
+            "env_vars": {},
+            "deployment_revision": rca_output.get(
+                "k8s_info", {}
+            ).get("deployment_revision", 0),
+            "root_cause": rca_output.get("root_cause", ""),
+        })
+
+        kb.save(
             rca_output.get("root_cause", ""),
             rca_output,
         )
+
+        self._write_log(service_name, rca_output, alert)
 
         print(
             f"\n  {GREEN}✓{RESET} Saved to knowledge base"
@@ -665,20 +762,232 @@ class FixIQPipeline:
                     )
 
         service = rca_output.get("service", "unknown")
-        print(f"\n  {BOLD}Apply Fix:{RESET}")
-        print(
-            f"  {DIM}kubectl set resources "
-            f"deployment/{service} "
-            f"--limits=memory=128Mi "
-            f"--requests=memory=64Mi{RESET}"
+        failure_type = rca_output.get(
+            "failure_type", "unknown"
         )
+
+        print(f"\n  {BOLD}Apply Fix:{RESET}")
+        if failure_type == "oomkilled":
+            fix_cmd = (
+                f"kubectl set resources "
+                f"deployment/{service} "
+                f"--limits=memory=128Mi "
+                f"--requests=memory=64Mi"
+            )
+            record_fix = "Increased memory limit to 128Mi"
+        elif failure_type == "image_pull":
+            fix_cmd = (
+                f"kubectl set image "
+                f"deployment/{service} "
+                f"{service}=<correct-image-name>"
+            )
+            record_fix = "Restored correct image"
+        elif failure_type == "crash":
+            fix_cmd = (
+                f"kubectl rollout undo "
+                f"deployment/{service}"
+            )
+            record_fix = "Rolled back bad deployment"
+        else:
+            fix_cmd = (
+                f"kubectl rollout undo "
+                f"deployment/{service}"
+            )
+            record_fix = "Applied fix"
+
+        print(f"  {DIM}{fix_cmd}{RESET}")
         print(
             f"\n  {BOLD}Record fix after applying:{RESET}"
         )
         print(
             f"  {DIM}fixiq record -s {service} "
-            f"-f 'Increased memory to 128Mi' "
+            f"-f '{record_fix}' "
             f"-m 5{RESET}"
+        )
+
+    def _check_recoveries(self) -> None:
+        """Check if previously broken services recovered.
+
+        Called at startup (Run 2). Diffs KB snapshots
+        vs current state and auto-records the fix.
+        """
+        from app.core.knowledge_base import KnowledgeBase
+        from app.core.k8s_collector import K8sCollector
+
+        kb = KnowledgeBase()
+        unresolved = kb.get_all_unresolved_snapshots()
+
+        if not unresolved:
+            return
+
+        collector = K8sCollector(namespace=self.namespace)
+        recovered = []
+
+        for service, snapshot in unresolved.items():
+            pod = collector.get_pod_details(service)
+            if not pod:
+                continue
+
+            is_healthy = (
+                pod.get("phase") == "Running" and
+                pod.get("exit_code", 0) == 0 and
+                pod.get("ready", False) and
+                pod.get("restart_count", 99) < 3
+            )
+
+            if is_healthy:
+                fix_description = self._detect_fix(
+                    service, snapshot, pod, collector
+                )
+                kb.record_fix(
+                    service=service,
+                    fix_applied=fix_description,
+                    time_to_fix_minutes=0,
+                )
+                kb.mark_snapshot_resolved(service)
+                recovered.append((service, fix_description))
+
+        if recovered:
+            print(f"\n{BOLD}{'═' * 70}{RESET}")
+            print(f"{BOLD}  ✅ RECOVERY DETECTED{RESET}")
+            print(f"{BOLD}{'═' * 70}{RESET}")
+            print(
+                f"\n  {GREEN}FixIQ detected the following "
+                f"services recovered since last run:{RESET}\n"
+            )
+            for service, fix in recovered:
+                print(
+                    f"  {GREEN}✓{RESET} {BOLD}{service}{RESET}"
+                )
+                print(f"    Fix detected: {fix}")
+                print(
+                    f"    {DIM}Auto-recorded to knowledge "
+                    f"base{RESET}\n"
+                )
+            print(f"{BOLD}{'═' * 70}{RESET}\n")
+
+    def _detect_fix(
+        self,
+        service: str,
+        snapshot: dict[str, Any],
+        current_pod: dict[str, Any],
+        collector: Any,
+    ) -> str:
+        """Diff broken snapshot vs current state."""
+        fixes = []
+
+        old_mem = snapshot.get("memory_limit", "")
+        current_info = collector.get_service_info(service)
+
+        if current_info:
+            new_mem = current_info.memory_limit
+            if old_mem and new_mem and old_mem != new_mem:
+                fixes.append(
+                    f"Increased memory limit "
+                    f"{old_mem} → {new_mem}"
+                )
+
+            old_rev = snapshot.get("deployment_revision", 0)
+            new_rev = current_info.deployment_revision
+            if new_rev and old_rev and new_rev != old_rev:
+                if not fixes:
+                    fixes.append(
+                        f"Deployment updated "
+                        f"(revision {old_rev} → {new_rev})"
+                    )
+
+            old_image = snapshot.get("image", "")
+            new_image = current_info.image
+            if (old_image and new_image and
+                    old_image != new_image):
+                fixes.append(
+                    f"Image updated: {new_image}"
+                )
+
+        old_exit = snapshot.get("exit_code", 0)
+        if old_exit == 137 and not fixes:
+            fixes.append(
+                f"Fixed OOMKilled — memory limit "
+                f"was {old_mem}"
+            )
+
+        if fixes:
+            return "; ".join(fixes)
+
+        return (
+            f"Service recovered "
+            f"(exact fix not detected — "
+            f"was: {snapshot.get('root_cause', 'unknown')})"
+        )
+
+    def _write_log(
+        self,
+        service_name: str,
+        rca_output: dict[str, Any],
+        alert: dict[str, Any],
+    ) -> None:
+        """Write incident report to log file."""
+        from pathlib import Path
+
+        reports_dir = (
+            Path.home() / ".config" / "fixiq" / "reports"
+        )
+        reports_dir.mkdir(parents=True, exist_ok=True)
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        log_file = reports_dir / f"{today}.log"
+
+        pod_details = alert.get("pod_details", {})
+        service_info = alert.get("service_info", {})
+        root_cause = rca_output.get("root_cause", "Unknown")
+        k8s_info = rca_output.get("k8s_info", {})
+        failure_type = rca_output.get(
+            "failure_type", "unknown"
+        )
+
+        lines = [
+            "=" * 70,
+            f"INCIDENT REPORT — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "=" * 70,
+            f"Service:      {service_name}",
+            f"Failure Type: {failure_type.upper()}",
+            f"Root Cause:   {root_cause}",
+            f"Memory Limit: {pod_details.get('memory_limit') or service_info.get('memory_limit', 'unknown')}",
+            f"Exit Code:    {pod_details.get('exit_code', 'unknown')}",
+            f"Restarts:     {pod_details.get('restart_count') or service_info.get('restart_count', 'unknown')}",
+            f"Revision:     {k8s_info.get('deployment_revision', 'unknown')}",
+            "",
+            "RECOMMENDED FIX:",
+        ]
+
+        if failure_type == "oomkilled":
+            lines.append(
+                f"  kubectl set resources deployment/{service_name} "
+                f"--limits=memory=128Mi --requests=memory=64Mi"
+            )
+        elif failure_type == "image_pull":
+            lines.append(
+                f"  kubectl set image deployment/{service_name} "
+                f"{service_name}=<correct-image-name>"
+            )
+        else:
+            lines.append(
+                f"  kubectl rollout undo deployment/{service_name}"
+            )
+
+        lines += [
+            "",
+            "AFTER APPLYING FIX — run fixiq again to auto-record recovery.",
+            "=" * 70,
+            "",
+        ]
+
+        with open(log_file, "a") as f:
+            f.write("\n".join(lines) + "\n")
+
+        print(
+            f"  {GREEN}✓{RESET} Report saved → "
+            f"{log_file}"
         )
 
     def _print_banner(self) -> None:
@@ -699,10 +1008,17 @@ class FixIQPipeline:
         print(
             f"  {GREEN}✓{RESET} Incident queue ready"
         )
-        print(
-            f"  {GREEN}✓{RESET} "
-            f"OpenSRE LLM ready (2min timeout)"
-        )
+        if self.OLLAMA_ENABLED:
+            print(
+                f"  {GREEN}✓{RESET} "
+                f"OpenSRE LLM ready (2min timeout)"
+            )
+        else:
+            print(
+                f"  {YELLOW}⚠{RESET} "
+                f"Ollama disabled (low RAM mode) "
+                f"— fallback RCA active"
+            )
         print(
             f"  {GREEN}✓{RESET} FixIQ analyzer ready"
         )

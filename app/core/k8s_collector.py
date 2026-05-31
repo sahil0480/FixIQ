@@ -54,9 +54,7 @@ class K8sClusterInfo:
 class K8sCollector:
     """Collects real data from Kubernetes cluster."""
 
-    def __init__(
-        self, namespace: str = "default"
-    ) -> None:
+    def __init__(self, namespace: str = "default") -> None:
         self.namespace = namespace
         self._available = self._check_kubectl()
 
@@ -115,89 +113,6 @@ class K8sCollector:
         except Exception:
             return ""
 
-    def get_pod_details(
-        self, service_name: str
-    ) -> dict[str, Any]:
-        """Get real pod details for a service.
-
-        Returns full pod details compatible with
-        pipeline health checks and analysis.
-        """
-        try:
-            result = subprocess.run(
-                [
-                    "kubectl", "get", "pods",
-                    "-n", self.namespace,
-                    "-l", f"app={service_name}",
-                    "-o", "json",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-
-            if result.returncode != 0:
-                return {}
-
-            data = json.loads(result.stdout)
-            items = data.get("items", [])
-            if not items:
-                return {}
-
-            pod = items[0]
-            status = pod.get("status", {})
-            spec = pod.get("spec", {})
-            containers = spec.get("containers", [{}])
-            container = containers[0] \
-                if containers else {}
-            resources = container.get("resources", {})
-            limits = resources.get("limits", {})
-            requests = resources.get("requests", {})
-
-            container_statuses = status.get(
-                "containerStatuses", [{}]
-            )
-            cs = container_statuses[0] \
-                if container_statuses else {}
-            last_state = cs.get("lastState", {})
-            terminated = last_state.get(
-                "terminated", {}
-            )
-
-            return {
-                "pod_name": pod.get(
-                    "metadata", {}
-                ).get("name", ""),
-                "phase": status.get(
-                    "phase", "Unknown"
-                ),
-                "restart_count": cs.get(
-                    "restartCount", 0
-                ),
-                "exit_code": terminated.get(
-                    "exitCode", 0
-                ),
-                "memory_limit": limits.get(
-                    "memory", "unknown"
-                ),
-                "memory_request": requests.get(
-                    "memory", "unknown"
-                ),
-                "cpu_limit": limits.get(
-                    "cpu", "unknown"
-                ),
-                "image": container.get(
-                    "image", "unknown"
-                ),
-                "ready": cs.get("ready", False),
-            }
-
-        except Exception as exc:
-            logger.warning(
-                "Failed to get pod details: %s", exc
-            )
-            return {}
-
     def get_service_info(
         self, service_name: str
     ) -> K8sServiceInfo | None:
@@ -218,8 +133,7 @@ class K8sCollector:
             containers = spec.get(
                 "template", {}
             ).get("spec", {}).get("containers", [{}])
-            container = containers[0] \
-                if containers else {}
+            container = containers[0] if containers else {}
             resources = container.get("resources", {})
             limits = resources.get("limits", {})
             requests = resources.get("requests", {})
@@ -236,20 +150,45 @@ class K8sCollector:
             if pods_data:
                 items = pods_data.get("items", [])
                 if items:
-                    pod = items[0]
-                    pod_status_obj = pod.get(
-                        "status", {}
+                    # Sort newest first, prefer unhealthy pod
+                    items.sort(
+                        key=lambda p: p.get(
+                            "metadata", {}
+                        ).get("creationTimestamp", ""),
+                        reverse=True,
                     )
+
+                    def _is_unhealthy(p: dict) -> bool:
+                        phase = p.get(
+                            "status", {}
+                        ).get("phase", "")
+                        cs = p.get("status", {}).get(
+                            "containerStatuses", [{}]
+                        )
+                        c = cs[0] if cs else {}
+                        return (
+                            phase in ("Failed", "Pending")
+                            or not c.get("ready", True)
+                            or c.get("restartCount", 0) > 0
+                        )
+
+                    unhealthy = [
+                        p for p in items
+                        if _is_unhealthy(p)
+                    ]
+                    pod = (
+                        unhealthy[0]
+                        if unhealthy else items[0]
+                    )
+                    pod_status_obj = pod.get("status", {})
                     pod_status = pod_status_obj.get(
                         "phase", "Unknown"
                     )
                     pod_conditions = pod_status_obj.get(
                         "conditions", []
                     )
-                    container_statuses = (
-                        pod_status_obj.get(
-                            "containerStatuses", []
-                        )
+                    container_statuses = pod_status_obj.get(
+                        "containerStatuses", []
                     )
                     if container_statuses:
                         restart_count = (
@@ -259,9 +198,7 @@ class K8sCollector:
                         )
 
             events = self._get_events(service_name)
-            dependents = self._get_dependents(
-                service_name
-            )
+            dependents = self._get_dependents(service_name)
 
             annotations = deployment.get(
                 "metadata", {}
@@ -283,15 +220,11 @@ class K8sCollector:
                 memory_request=requests.get(
                     "memory", "unknown"
                 ),
-                cpu_limit=limits.get(
-                    "cpu", "unknown"
-                ),
+                cpu_limit=limits.get("cpu", "unknown"),
                 cpu_request=requests.get(
                     "cpu", "unknown"
                 ),
-                image=container.get(
-                    "image", "unknown"
-                ),
+                image=container.get("image", "unknown"),
                 restart_count=restart_count,
                 pod_status=pod_status,
                 pod_conditions=pod_conditions,
@@ -330,9 +263,7 @@ class K8sCollector:
                             "time": parts[0],
                             "type": parts[1],
                             "reason": parts[2],
-                            "message": " ".join(
-                                parts[4:]
-                            ),
+                            "message": " ".join(parts[4:]),
                         })
             return events[-10:]
 
@@ -464,9 +395,9 @@ class K8sCollector:
                     f"--tail={lines}",
                 ])
             return [
-                line for line in
+                l for l in
                 output.strip().split("\n")
-                if line.strip()
+                if l.strip()
             ]
         except Exception:
             return []
@@ -474,3 +405,11 @@ class K8sCollector:
     def is_available(self) -> bool:
         """Check if K8s cluster is accessible."""
         return self._available
+
+    def get_pod_details(
+        self, service_name: str
+    ) -> dict[str, Any]:
+        """Get pod details — delegates to watcher logic."""
+        from app.core.k8s_watcher import K8sWatcher
+        w = K8sWatcher(namespace=self.namespace)
+        return w.get_pod_details(service_name)

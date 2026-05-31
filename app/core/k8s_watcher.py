@@ -81,11 +81,7 @@ class K8sWatcher:
         self,
         on_incident: Callable[[K8sIncident], None],
     ) -> None:
-        """Watch for incidents and call callback.
-
-        Args:
-            on_incident: Called when incident detected
-        """
+        """Watch for incidents and call callback."""
         self._running = True
 
         print(f"\n  👀 Watching Kubernetes events...")
@@ -93,8 +89,6 @@ class K8sWatcher:
         print(f"  Poll interval: {self.poll_interval}s")
         print(f"  Press Ctrl+C to stop\n")
 
-        # First poll marks startup events as seen
-        # without triggering investigations
         self._seed_seen_events()
         self._is_startup = False
 
@@ -115,11 +109,7 @@ class K8sWatcher:
                 time.sleep(self.poll_interval)
 
     def _seed_seen_events(self) -> None:
-        """Mark existing old events as seen on startup.
-
-        This prevents FixIQ from re-investigating
-        incidents that happened before it started.
-        """
+        """Mark existing old events as seen on startup."""
         try:
             result = subprocess.run(
                 [
@@ -152,7 +142,6 @@ class K8sWatcher:
                 if not event_id:
                     continue
 
-                # Check event age
                 last_timestamp = event.get(
                     "lastTimestamp", ""
                 )
@@ -167,12 +156,10 @@ class K8sWatcher:
                             now - event_time
                         ).total_seconds()
 
-                        # Mark old events as seen
                         if age > STARTUP_EVENT_MAX_AGE:
                             self._seen_events.add(event_id)
                             seeded += 1
                     except Exception:
-                        # If can't parse, mark as seen
                         self._seen_events.add(event_id)
                         seeded += 1
                 else:
@@ -192,11 +179,7 @@ class K8sWatcher:
             )
 
     def mark_resolved(self, service: str) -> None:
-        """Mark a service as resolved.
-
-        Args:
-            service: Service name that was fixed
-        """
+        """Mark a service as resolved."""
         self._resolved_services[service] = time.time()
         logger.info(
             "Marked %s as resolved for %ds",
@@ -275,7 +258,6 @@ class K8sWatcher:
         if not event_id or event_id in self._seen_events:
             return None
 
-        # Check event age — skip old events
         last_timestamp = event.get("lastTimestamp", "")
         if last_timestamp:
             try:
@@ -285,7 +267,6 @@ class K8sWatcher:
                 now = datetime.now(timezone.utc)
                 age = (now - event_time).total_seconds()
 
-                # Skip events older than 5 min on startup
                 if self._is_startup and \
                         age > STARTUP_EVENT_MAX_AGE:
                     self._seen_events.add(event_id)
@@ -300,7 +281,6 @@ class K8sWatcher:
         service = involved.get("name", "unknown")
         service_name = self._extract_service_name(service)
 
-        # Skip recently resolved services
         if self.is_resolved(service_name):
             logger.info(
                 "Skipping %s — recently resolved",
@@ -336,11 +316,7 @@ class K8sWatcher:
     def _extract_service_name(
         self, pod_name: str
     ) -> str:
-        """Extract service name from pod name.
-
-        e.g. checkout-api-789d77895-kjghv
-             → checkout-api
-        """
+        """Extract service name from pod name."""
         parts = pod_name.split("-")
         if len(parts) > 2:
             return "-".join(parts[:-2])
@@ -349,7 +325,11 @@ class K8sWatcher:
     def get_pod_details(
         self, service_name: str
     ) -> dict[str, Any]:
-        """Get real pod details for a service."""
+        """Get real pod details for a service.
+
+        Prefers the unhealthy/newest pod over old
+        healthy pods left running during rolling updates.
+        """
         try:
             result = subprocess.run(
                 [
@@ -371,7 +351,40 @@ class K8sWatcher:
             if not items:
                 return {}
 
-            pod = items[0]
+            # Sort by creationTimestamp — newest first
+            items.sort(
+                key=lambda p: p.get(
+                    "metadata", {}
+                ).get("creationTimestamp", ""),
+                reverse=True,
+            )
+
+            # Prefer unhealthy pod over healthy one
+            # (rolling update leaves old healthy pod running)
+            def is_unhealthy(p: dict) -> bool:
+                phase = p.get("status", {}).get(
+                    "phase", ""
+                )
+                cs = p.get("status", {}).get(
+                    "containerStatuses", [{}]
+                )
+                c = cs[0] if cs else {}
+                exit_code = (
+                    c.get("lastState", {})
+                    .get("terminated", {})
+                    .get("exitCode", 0)
+                )
+                ready = c.get("ready", True)
+                return (
+                    phase in ("Failed", "Pending") or
+                    not ready or
+                    exit_code != 0 or
+                    c.get("restartCount", 0) > 0
+                )
+
+            unhealthy = [p for p in items if is_unhealthy(p)]
+            pod = unhealthy[0] if unhealthy else items[0]
+
             status = pod.get("status", {})
             spec = pod.get("spec", {})
             containers = spec.get("containers", [{}])

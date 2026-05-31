@@ -77,15 +77,12 @@ class SimilarIncidentsFinder:
             )
             if score >= 0.3:
                 similar.append(SimilarIncident(
-                    id=incident.get(
-                        "hash", incident.get("id", "unknown")
-                    ),
+                    id=incident.get("hash", "unknown"),
                     date=incident.get("date", "unknown"),
                     root_cause=incident.get("root_cause", ""),
                     service=incident.get("service", "unknown"),
                     fix_applied=incident.get(
-                        "fix_applied",
-                        incident.get("fix", "Not yet applied")
+                        "fix_applied", "Not yet applied"
                     ),
                     time_to_fix_minutes=incident.get(
                         "time_to_fix_minutes", 0
@@ -148,18 +145,72 @@ class SimilarIncidentsFinder:
             time_to_fix_minutes=time_to_fix_minutes,
         )
 
+    def _detect_failure_type(
+        self, root_cause: str
+    ) -> str:
+        """Detect failure type from root cause string."""
+        rc = root_cause.lower()
+        if any(k in rc for k in [
+            "oomkilled", "memory limit", "exit code: 137",
+            "exit code 137", "out of memory",
+        ]):
+            return "oomkilled"
+        if any(k in rc for k in [
+            "image pull", "errimagepull", "imagepullbackoff",
+            "errimageneverpull", "cannot be pulled",
+            "image not found",
+        ]):
+            return "image_pull"
+        if any(k in rc for k in [
+            "crash", "exit code 1", "exit code: 1",
+            "bad startup", "startup command",
+            "rollback", "bad command",
+        ]):
+            return "crash"
+        if any(k in rc for k in [
+            "cpu", "throttl",
+        ]):
+            return "cpu"
+        return "unknown"
+
     def _calculate_similarity(
         self,
         root_cause: str,
         service_name: str,
         incident: dict[str, Any],
     ) -> float:
-        """Calculate similarity between two incidents."""
+        """Calculate similarity between two incidents.
+
+        Factors (in order of importance):
+        1. Failure type match — most important
+        2. Same service
+        3. Root cause word overlap
+        4. Resolved outcome bonus
+        """
         score = 0.0
 
-        if incident.get("service") == service_name:
-            score += 0.3
+        # Detect failure types
+        current_type = self._detect_failure_type(root_cause)
+        past_type = self._detect_failure_type(
+            incident.get("root_cause", "")
+        )
+        # Use stored failure_type field if present
+        stored_type = incident.get("failure_type", "")
+        if stored_type:
+            past_type = stored_type
 
+        # Failure type match/mismatch — most important signal
+        if current_type != "unknown" and past_type != "unknown":
+            if current_type == past_type:
+                score += 0.4  # Strong boost for same type
+            else:
+                score -= 0.3  # Penalise different type
+
+        # Same service
+        if incident.get("service") == service_name:
+            score += 0.2
+
+        # Root cause word overlap — reduced weight
         current_words = set(root_cause.lower().split())
         past_words = set(
             incident.get("root_cause", "").lower().split()
@@ -169,12 +220,13 @@ class SimilarIncidentsFinder:
             similarity = len(overlap) / max(
                 len(current_words), len(past_words)
             )
-            score += similarity * 0.5
+            score += similarity * 0.3
 
+        # Resolved incidents are more valuable
         if incident.get("outcome") == "resolved":
-            score += 0.2
+            score += 0.1
 
-        return round(min(1.0, score), 2)
+        return round(max(0.0, min(1.0, score)), 2)
 
     def _calculate_success_rate(
         self, incidents: list[SimilarIncident]
@@ -203,7 +255,7 @@ class SimilarIncidentsFinder:
         self,
         all_similar: list[SimilarIncident],
     ) -> str:
-        """Build fix recommendation.
+        """Build fix recommendation from history.
 
         Prioritises resolved entries with a real fix.
         Falls back to best similarity match if none resolved.

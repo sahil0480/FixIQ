@@ -6,16 +6,17 @@ Used by both the pipeline (auto-save) and the CLI
 
 Schema (one entry per unique root cause hash):
 {
-    "hash":               str,   # md5 of root_cause
+    "hash":               str,
     "root_cause":         str,
     "service":            str,
-    "date":               str,   # first seen
+    "failure_type":       str,   # oomkilled/image_pull/crash/unknown
+    "date":               str,
     "last_seen":          str,
     "occurrences":        int,
-    "fix_applied":        str,   # "Not yet applied" until recorded
+    "fix_applied":        str,
     "fix_date":           str | null,
     "time_to_fix_minutes":int,
-    "outcome":            str    # "unknown" | "resolved" | "partial"
+    "outcome":            str
 }
 """
 
@@ -66,12 +67,33 @@ class KnowledgeBase:
 
     def _hash(self, root_cause: str) -> str:
         import re
-        # Strip restart count so same issue with different
-        # restart counts maps to the same hash
         normalised = re.sub(
             r'\. Restart count: \d+', '', root_cause
         ).lower().strip()
         return hashlib.md5(normalised.encode()).hexdigest()[:8]
+
+    def _detect_failure_type(
+        self, root_cause: str, rca_output: dict | None = None
+    ) -> str:
+        """Detect failure type from root cause string."""
+        rc = root_cause.lower()
+        if any(k in rc for k in [
+            "oomkilled", "memory limit", "exit code 137",
+        ]):
+            return "oomkilled"
+        if any(k in rc for k in [
+            "image pull", "errimagepull", "cannot be pulled",
+            "imagepullbackoff", "errimageneverpull",
+        ]):
+            return "image_pull"
+        if any(k in rc for k in [
+            "crash", "exit code 1", "bad startup",
+            "startup command",
+        ]):
+            return "crash"
+        if rca_output:
+            return rca_output.get("failure_type", "unknown")
+        return "unknown"
 
     def save(
         self,
@@ -88,7 +110,9 @@ class KnowledgeBase:
         issue_hash = self._hash(root_cause)
         service = (
             rca_output.get("service")
-            or rca_output.get("k8s_info", {}).get("service", "unknown")
+            or rca_output.get("k8s_info", {}).get(
+                "service", "unknown"
+            )
         )
 
         for incident in data["incidents"]:
@@ -97,7 +121,6 @@ class KnowledgeBase:
                 incident["occurrences"] = (
                     incident.get("occurrences", 1) + 1
                 )
-                # Only update fix if a real one is being recorded
                 if fix_applied and fix_applied != "Not yet applied":
                     incident["fix_applied"] = fix_applied
                     incident["fix_date"] = datetime.now().isoformat()
@@ -105,10 +128,15 @@ class KnowledgeBase:
                 self._save(data)
                 return
 
+        failure_type = self._detect_failure_type(
+            root_cause, rca_output
+        )
+
         incident = {
             "hash": issue_hash,
             "root_cause": root_cause,
             "service": service,
+            "failure_type": failure_type,
             "date": datetime.now().isoformat(),
             "last_seen": datetime.now().isoformat(),
             "occurrences": 1,
@@ -128,11 +156,7 @@ class KnowledgeBase:
         fix_applied: str,
         time_to_fix_minutes: int = 0,
     ) -> bool:
-        """Record a confirmed fix for a service.
-
-        Updates the most recent unresolved incident for the
-        service. Returns True if an incident was updated.
-        """
+        """Record a confirmed fix for a service."""
         data = self._load()
         updated = False
 
@@ -147,7 +171,8 @@ class KnowledgeBase:
                     )
                 updated = True
                 logger.info(
-                    "Recorded fix for %s: %s", service, fix_applied
+                    "Recorded fix for %s: %s",
+                    service, fix_applied
                 )
                 break
 
@@ -158,6 +183,7 @@ class KnowledgeBase:
                 ),
                 "root_cause": f"Incident in {service}",
                 "service": service,
+                "failure_type": "unknown",
                 "date": datetime.now().isoformat(),
                 "last_seen": datetime.now().isoformat(),
                 "occurrences": 1,
@@ -189,3 +215,64 @@ class KnowledgeBase:
         """Clear the knowledge base."""
         self._save({"incidents": []})
         logger.info("Knowledge base cleared")
+
+    def save_snapshot(
+        self,
+        service: str,
+        snapshot: dict[str, Any],
+    ) -> None:
+        """Save a broken-state snapshot for a service."""
+        data = self._load()
+        snapshots = data.get("snapshots", {})
+        snapshots[service] = {
+            "timestamp": datetime.now().isoformat(),
+            "memory_limit": snapshot.get("memory_limit", ""),
+            "memory_request": snapshot.get("memory_request", ""),
+            "cpu_limit": snapshot.get("cpu_limit", ""),
+            "image": snapshot.get("image", ""),
+            "restart_count": snapshot.get("restart_count", 0),
+            "exit_code": snapshot.get("exit_code", 0),
+            "env_vars": snapshot.get("env_vars", {}),
+            "deployment_revision": snapshot.get(
+                "deployment_revision", 0
+            ),
+            "root_cause": snapshot.get("root_cause", ""),
+            "resolved": False,
+        }
+        data["snapshots"] = snapshots
+        self._save(data)
+        logger.info("Saved snapshot for %s", service)
+
+    def get_snapshot(
+        self, service: str
+    ) -> dict[str, Any] | None:
+        """Get the last broken-state snapshot for a service."""
+        data = self._load()
+        snapshots = data.get("snapshots", {})
+        snap = snapshots.get(service)
+        if snap and not snap.get("resolved", False):
+            return snap
+        return None
+
+    def mark_snapshot_resolved(
+        self, service: str
+    ) -> None:
+        """Mark a snapshot as resolved after recovery."""
+        data = self._load()
+        snapshots = data.get("snapshots", {})
+        if service in snapshots:
+            snapshots[service]["resolved"] = True
+            data["snapshots"] = snapshots
+            self._save(data)
+
+    def get_all_unresolved_snapshots(
+        self,
+    ) -> dict[str, dict[str, Any]]:
+        """Get all services with unresolved snapshots."""
+        data = self._load()
+        snapshots = data.get("snapshots", {})
+        return {
+            svc: snap
+            for svc, snap in snapshots.items()
+            if not snap.get("resolved", False)
+        }
